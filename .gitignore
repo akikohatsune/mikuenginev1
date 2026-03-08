@@ -1,0 +1,9 @@
+/target
+/mikuengine-windows
+/mikuengine.exe
+*.nnue
+/node_modules
+/Stockfish
+/test.in
+package-lock.json
+package.json

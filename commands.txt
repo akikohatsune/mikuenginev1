@@ -1,0 +1,4 @@
+uci
+ucinewgame
+position fen rnbbqnkr/pppppppp/8/8/8/8/PPPPPPPP/RNBBQNKR w - - 0 1 moves g2g4
+go depth 16
