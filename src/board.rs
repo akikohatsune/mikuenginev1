@@ -65,9 +65,13 @@ impl Board {
     pub fn is_repetition(&self) -> bool {
         let len = self.position_history.len();
         if len < 4 { return false; }
+        
+        // Only check back as far as the halfmove clock allows (50-move rule)
         let limit = len.saturating_sub(self.halfmove_clock as usize);
-        let mut i = len.wrapping_sub(2);
-        while i >= limit && i < len {
+        
+        // Check positions at even intervals (same side to move)
+        let mut i = len - 2;
+        while i >= limit {
             if self.position_history[i] == self.zobrist_key {
                 return true;
             }

@@ -660,13 +660,15 @@ impl Search {
                     if ply == 0 {
                         self.best_move = m;
                     }
-                    
+
                     // Update PV
                     self.pv_table[ply][ply] = m;
-                    for j in (ply + 1)..self.pv_length[ply + 1] {
-                        self.pv_table[ply][j] = self.pv_table[ply + 1][j];
+                    if ply + 1 < MAX_PLY {
+                        for j in (ply + 1)..self.pv_length[ply + 1] {
+                            self.pv_table[ply][j] = self.pv_table[ply + 1][j];
+                        }
+                        self.pv_length[ply] = self.pv_length[ply + 1];
                     }
-                    self.pv_length[ply] = self.pv_length[ply + 1];
                 }
                 
                 // Track quiet moves searched
