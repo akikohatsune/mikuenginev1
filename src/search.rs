@@ -355,13 +355,7 @@ impl Search {
         // Null Move Pruning
         if cut_node && !in_check && depth >= 3 && has_non_pawn_material && eval >= beta {
             let undo = board.make_null_move();
-            let mut r = 4 + depth / 3;
-            if eval - beta > 0 {
-                r += ((eval - beta) as u8 / 200).min(3);
-            }
-            if opponent_worsening {
-                r = r.saturating_sub(1);
-            }
+            let r = 3;
             let null_depth = depth.saturating_sub(r);
             let null_score =
                 -self.negamax(board, null_depth, -beta, -beta + 1, ply + 1, None, !pv_node);
@@ -659,7 +653,7 @@ impl Search {
                 // --- Late Move Reductions (LMR) ---
                 let mut needs_full_search = true;
 
-                if legal_moves >= 3
+                if legal_moves >= 4
                     && depth >= 3
                     && !is_capture
                     && !is_promo

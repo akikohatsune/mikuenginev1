@@ -240,7 +240,6 @@ impl MovePicker {
                 self.scores[i] = -20_000_000; // Low priority
             }
         }
-        self.sort_moves();
     }
 
     fn score_quiets(&mut self, heuristics: &Heuristics, board: &Board) {
@@ -312,7 +311,6 @@ impl MovePicker {
                 self.scores[i] = -20_000_000;
             }
         }
-        self.sort_moves();
     }
 
     fn score_evasions(&mut self, heuristics: &Heuristics, board: &Board) {
@@ -348,23 +346,22 @@ impl MovePicker {
                 self.scores[i] = heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
             }
         }
-        self.sort_moves();
-    }
-
-    fn sort_moves(&mut self) {
-        let count = self.list.count;
-        for i in 1..count {
-            let mut j = i;
-            while j > 0 && self.scores[j - 1] < self.scores[j] {
-                self.scores.swap(j - 1, j);
-                self.list.moves.swap(j - 1, j);
-                j -= 1;
-            }
-        }
     }
 
     fn get_next_scored_move(&mut self) -> Option<Move> {
         if self.cur < self.list.count {
+            let mut best_idx = self.cur;
+            let mut best_score = self.scores[self.cur];
+            for i in (self.cur + 1)..self.list.count {
+                if self.scores[i] > best_score {
+                    best_score = self.scores[i];
+                    best_idx = i;
+                }
+            }
+            
+            self.scores.swap(self.cur, best_idx);
+            self.list.moves.swap(self.cur, best_idx);
+
             let m = self.list.moves[self.cur];
             self.cur += 1;
             Some(m)
