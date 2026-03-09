@@ -208,12 +208,26 @@ impl Search {
 
         self.pv_length[ply] = ply;
 
+        let total_pieces = board.colors[crate::types::Color::White as usize].count()
+            + board.colors[crate::types::Color::Black as usize].count();
+
+        let mut pressure = 0.0;
+        if total_pieces <= 12 {
+            let lazy_eval = board.nnue.evaluate(board.side_to_move, &board.accumulator);
+            if lazy_eval > 120 {
+                pressure = ((lazy_eval as f32 - 120.0) / 200.0).clamp(0.0, 1.0);
+            }
+        }
+
         // Draw detection
-        let draw_score = -1 + (self.nodes & 2) as i32;
+        let mut draw_score = -1 + (self.nodes & 2) as i32;
         if board.halfmove_clock >= 100 {
             return draw_score;
         }
         if ply > 0 && board.is_repetition() {
+            if pressure > 0.0 {
+                draw_score -= (pressure * 50.0) as i32;
+            }
             return draw_score;
         }
 
@@ -286,6 +300,11 @@ impl Search {
             board.nnue.evaluate(side, &board.accumulator)
         };
 
+        if !in_check && total_pieces <= 12 && eval > 120 {
+            pressure = ((eval as f32 - 120.0) / 200.0).clamp(0.0, 1.0);
+            eval += ((32 - total_pieces) as f32 * pressure * 10.0) as i32;
+        }
+
         // --- Calculate Correction Value ---
         let mut correction_value = 0;
         let mat_hash = board.non_pawn_material(side) as usize;
@@ -333,7 +352,7 @@ impl Search {
         }
 
         // Null Move Pruning
-        if cut_node && !in_check && depth >= 3 && has_non_pawn_material && eval >= beta {
+        if cut_node && !in_check && depth >= 3 && has_non_pawn_material && eval >= beta && total_pieces > 5 {
             let undo = board.make_null_move();
             let r = 3;
             let null_depth = depth.saturating_sub(r);
@@ -366,7 +385,6 @@ impl Search {
                 tt_move = Some(entry.best_move);
             }
         }
-
         let is_shuffling = board.halfmove_clock >= 20;
 
         // ------------------------------------------------------------------
@@ -540,7 +558,14 @@ impl Search {
                         || (side == crate::types::Color::Black && rank <= 1)
                     {
                         extension = extension.max(1);
+                        if pressure > 0.5 {
+                            extension += 1;
+                        }
                     }
+                }
+
+                if is_promo {
+                    extension = extension.max(1);
                 }
 
                 let mut stat_score = 0;
@@ -641,7 +666,8 @@ impl Search {
                     && !gives_check
                 {
                     // Dynamic LMR Formula
-                    let mut r = (depth as i32 / 3) + (legal_moves as i32 / 5);
+                    let reduction_f32 = ((depth as f32).ln() * (legal_moves as f32).ln()) / 2.0;
+                    let mut r = reduction_f32 as i32;
 
                     // Apply smaller reduction in PV nodes
                     if pv_node {
