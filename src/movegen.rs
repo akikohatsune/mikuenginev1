@@ -1,11 +1,17 @@
+use crate::attacks;
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::types::{Color, Move, PieceType, Square};
-use crate::attacks;
 
 pub struct MoveList {
     pub moves: [Move; 256],
     pub count: usize,
+}
+
+impl Default for MoveList {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MoveList {
@@ -28,7 +34,7 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
     let us = board.color_occupancy(side);
     let them = board.color_occupancy(side.flip());
     let empty = !(us | them);
-    
+
     // PAWNS
     let pawns = board.color_piece_bb(side, PieceType::Pawn);
     if side == Color::White {
@@ -38,7 +44,8 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
         while bb.is_not_empty() {
             let to = bb.pop_lsb();
             let from = to - 8;
-            if to >= 56 { // Promotion
+            if to >= 56 {
+                // Promotion
                 list.push(Move::new(from, to, Move::FLAG_PR_QUEEN));
                 list.push(Move::new(from, to, Move::FLAG_PR_ROOK));
                 list.push(Move::new(from, to, Move::FLAG_PR_BISHOP));
@@ -67,7 +74,8 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
             let mut att_bb = attacks;
             while att_bb.is_not_empty() {
                 let to = att_bb.pop_lsb();
-                if to >= 56 { // Promo capture
+                if to >= 56 {
+                    // Promo capture
                     list.push(Move::new(from, to, Move::FLAG_PC_QUEEN));
                     list.push(Move::new(from, to, Move::FLAG_PC_ROOK));
                     list.push(Move::new(from, to, Move::FLAG_PC_BISHOP));
@@ -91,7 +99,8 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
         while bb.is_not_empty() {
             let to = bb.pop_lsb();
             let from = to + 8;
-            if to <= 7 { // Promotion
+            if to <= 7 {
+                // Promotion
                 list.push(Move::new(from, to, Move::FLAG_PR_QUEEN));
                 list.push(Move::new(from, to, Move::FLAG_PR_ROOK));
                 list.push(Move::new(from, to, Move::FLAG_PR_BISHOP));
@@ -118,7 +127,8 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
             let mut att_bb = pawn_attacks & them;
             while att_bb.is_not_empty() {
                 let to = att_bb.pop_lsb();
-                if to <= 7 { // Promo cap
+                if to <= 7 {
+                    // Promo cap
                     list.push(Move::new(from, to, Move::FLAG_PC_QUEEN));
                     list.push(Move::new(from, to, Move::FLAG_PC_ROOK));
                     list.push(Move::new(from, to, Move::FLAG_PC_BISHOP));
@@ -207,7 +217,11 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
 
     // KING
     let mut kings = board.color_piece_bb(side, PieceType::King);
-    let k_sq = if kings.is_not_empty() { kings.pop_lsb() } else { return; };
+    let k_sq = if kings.is_not_empty() {
+        kings.pop_lsb()
+    } else {
+        return;
+    };
     let attacks = attacks::king_attacks(Square::new(k_sq)) & !us;
     let mut captures = attacks & them;
     let mut quiets = attacks & empty;
@@ -223,18 +237,22 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
 
     // CASTLING (simplified, legality checked later)
     if side == Color::White {
-        if board.castling.has_wk() {
-            if (occ.0 & 0x60) == 0 { list.push(Move::new(4, 6, Move::FLAG_K_CASTLE)); }
-        }
-        if board.castling.has_wq() {
-            if (occ.0 & 0xE) == 0 { list.push(Move::new(4, 2, Move::FLAG_Q_CASTLE)); }
-        }
+        if board.castling.has_wk()
+            && (occ.0 & 0x60) == 0 {
+                list.push(Move::new(4, 6, Move::FLAG_K_CASTLE));
+            }
+        if board.castling.has_wq()
+            && (occ.0 & 0xE) == 0 {
+                list.push(Move::new(4, 2, Move::FLAG_Q_CASTLE));
+            }
     } else {
-        if board.castling.has_bk() {
-            if (occ.0 & 0x6000000000000000) == 0 { list.push(Move::new(60, 62, Move::FLAG_K_CASTLE)); }
-        }
-        if board.castling.has_bq() {
-            if (occ.0 & 0x0E00000000000000) == 0 { list.push(Move::new(60, 58, Move::FLAG_Q_CASTLE)); }
-        }
+        if board.castling.has_bk()
+            && (occ.0 & 0x6000000000000000) == 0 {
+                list.push(Move::new(60, 62, Move::FLAG_K_CASTLE));
+            }
+        if board.castling.has_bq()
+            && (occ.0 & 0x0E00000000000000) == 0 {
+                list.push(Move::new(60, 58, Move::FLAG_Q_CASTLE));
+            }
     }
 }

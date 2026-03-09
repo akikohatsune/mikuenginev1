@@ -2,9 +2,8 @@
 ///
 /// Two accumulators: one for White's perspective, one for Black's.
 /// Each is TRANSFORMED_SIZE (256) i16 values.
-/// 
+///
 /// Stack-based push/pop for make_move / unmake_move.
-
 use super::feature::TRANSFORMED_SIZE;
 use super::network::NetworkParams;
 
@@ -14,9 +13,17 @@ pub struct SideAccumulator {
     pub values: [i16; TRANSFORMED_SIZE],
 }
 
+impl Default for SideAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SideAccumulator {
     pub const fn new() -> Self {
-        SideAccumulator { values: [0; TRANSFORMED_SIZE] }
+        SideAccumulator {
+            values: [0; TRANSFORMED_SIZE],
+        }
     }
 }
 
@@ -25,6 +32,12 @@ impl SideAccumulator {
 pub struct Accumulator {
     pub white: SideAccumulator,
     pub black: SideAccumulator,
+}
+
+impl Default for Accumulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Accumulator {
@@ -38,27 +51,46 @@ impl Accumulator {
     /// Initialize from biases (full refresh)
     #[inline]
     pub fn init_from_bias(&mut self, params: &NetworkParams) {
-        self.white.values.copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
-        self.black.values.copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
+        self.white
+            .values
+            .copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
+        self.black
+            .values
+            .copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
     }
 
     /// Full refresh: reset to bias, then add all active features
-    pub fn refresh(&mut self, white_features: &[usize], black_features: &[usize], params: &NetworkParams) {
+    pub fn refresh(
+        &mut self,
+        white_features: &[usize],
+        black_features: &[usize],
+        params: &NetworkParams,
+    ) {
         self.init_from_bias(params);
         for &fi in white_features {
             let offset = fi * TRANSFORMED_SIZE;
-            debug_assert!(offset + TRANSFORMED_SIZE <= params.ft_weight.len(),
-                "White feature index {} out of bounds (max {})", fi, params.ft_weight.len() / TRANSFORMED_SIZE);
+            debug_assert!(
+                offset + TRANSFORMED_SIZE <= params.ft_weight.len(),
+                "White feature index {} out of bounds (max {})",
+                fi,
+                params.ft_weight.len() / TRANSFORMED_SIZE
+            );
             for i in 0..TRANSFORMED_SIZE {
-                self.white.values[i] += unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
+                self.white.values[i] +=
+                    unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
             }
         }
         for &fi in black_features {
             let offset = fi * TRANSFORMED_SIZE;
-            debug_assert!(offset + TRANSFORMED_SIZE <= params.ft_weight.len(),
-                "Black feature index {} out of bounds (max {})", fi, params.ft_weight.len() / TRANSFORMED_SIZE);
+            debug_assert!(
+                offset + TRANSFORMED_SIZE <= params.ft_weight.len(),
+                "Black feature index {} out of bounds (max {})",
+                fi,
+                params.ft_weight.len() / TRANSFORMED_SIZE
+            );
             for i in 0..TRANSFORMED_SIZE {
-                self.black.values[i] += unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
+                self.black.values[i] +=
+                    unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
             }
         }
     }
@@ -72,8 +104,10 @@ impl Accumulator {
         debug_assert!(b_offset + TRANSFORMED_SIZE <= params.ft_weight.len());
         for i in 0..TRANSFORMED_SIZE {
             unsafe {
-                *self.white.values.get_unchecked_mut(i) += *params.ft_weight.get_unchecked(w_offset + i) as i16;
-                *self.black.values.get_unchecked_mut(i) += *params.ft_weight.get_unchecked(b_offset + i) as i16;
+                *self.white.values.get_unchecked_mut(i) +=
+                    *params.ft_weight.get_unchecked(w_offset + i) as i16;
+                *self.black.values.get_unchecked_mut(i) +=
+                    *params.ft_weight.get_unchecked(b_offset + i) as i16;
             }
         }
     }
@@ -87,8 +121,10 @@ impl Accumulator {
         debug_assert!(b_offset + TRANSFORMED_SIZE <= params.ft_weight.len());
         for i in 0..TRANSFORMED_SIZE {
             unsafe {
-                *self.white.values.get_unchecked_mut(i) -= *params.ft_weight.get_unchecked(w_offset + i) as i16;
-                *self.black.values.get_unchecked_mut(i) -= *params.ft_weight.get_unchecked(b_offset + i) as i16;
+                *self.white.values.get_unchecked_mut(i) -=
+                    *params.ft_weight.get_unchecked(w_offset + i) as i16;
+                *self.black.values.get_unchecked_mut(i) -=
+                    *params.ft_weight.get_unchecked(b_offset + i) as i16;
             }
         }
     }
@@ -97,6 +133,12 @@ impl Accumulator {
 /// Stack for O(1) unmake_move restoration
 pub struct AccumulatorStack {
     stack: Vec<Accumulator>,
+}
+
+impl Default for AccumulatorStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AccumulatorStack {

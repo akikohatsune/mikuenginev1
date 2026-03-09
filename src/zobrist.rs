@@ -1,4 +1,4 @@
-use crate::types::{Color, PieceType, Square, CastlingRights};
+use crate::types::{CastlingRights, Color, PieceType, Square};
 
 pub const NUM_PIECES: usize = 12; // 2 colors * 6 types
 pub const NUM_SQUARES: usize = 64;
@@ -10,10 +10,16 @@ pub struct ZobristKeys {
     pub en_passant: [u64; 8], // File 0-7
 }
 
+impl Default for ZobristKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZobristKeys {
     pub const fn new() -> Self {
         let mut seed = 1070372_u64;
-        
+
         const fn rand64(s: &mut u64) -> u64 {
             let mut x = *s;
             x ^= x >> 12;

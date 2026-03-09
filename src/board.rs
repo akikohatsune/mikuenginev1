@@ -1,10 +1,12 @@
 use crate::bitboard::Bitboard;
-use crate::types::{Color, Piece, PieceType, Square, CastlingRights, Move, NUM_PIECE_TYPES, NUM_COLORS};
+use crate::types::{
+    CastlingRights, Color, Move, Piece, PieceType, Square, NUM_COLORS, NUM_PIECE_TYPES,
+};
 use crate::zobrist;
 
-use std::sync::Arc;
-use crate::nnue::{NNUE, Accumulator, feature_index};
 use crate::attacks;
+use crate::nnue::{feature_index, Accumulator, NNUE};
+use std::sync::Arc;
 
 pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -22,21 +24,21 @@ pub struct UndoState {
 pub struct Board {
     pub pieces: [Bitboard; NUM_PIECE_TYPES],
     pub colors: [Bitboard; NUM_COLORS],
-    
+
     pub piece_on_sq: [Option<Piece>; 64],
 
     pub side_to_move: Color,
     pub en_passant: Option<Square>,
     pub castling: CastlingRights,
-    
+
     pub halfmove_clock: u8,
     pub fullmove_number: u16,
 
     pub zobrist_key: u64,
-    
+
     pub accumulator: Accumulator,
     pub nnue: Arc<NNUE>,
-    
+
     pub position_history: Vec<u64>,
 }
 
@@ -64,18 +66,22 @@ impl Board {
 
     pub fn is_repetition(&self) -> bool {
         let len = self.position_history.len();
-        if len < 4 { return false; }
-        
+        if len < 4 {
+            return false;
+        }
+
         // Only check back as far as the halfmove clock allows (50-move rule)
         let limit = len.saturating_sub(self.halfmove_clock as usize);
-        
+
         // Check positions at even intervals (same side to move)
         let mut i = len - 2;
         while i >= limit {
             if self.position_history[i] == self.zobrist_key {
                 return true;
             }
-            if i < 2 { break; }
+            if i < 2 {
+                break;
+            }
             i -= 2;
         }
         false
@@ -89,13 +95,21 @@ impl Board {
             Some(p) => p,
             None => return false,
         };
-        if piece.color() != self.side_to_move { return false; }
+        if piece.color() != self.side_to_move {
+            return false;
+        }
 
         if let Some(target) = self.piece_on_sq[to.0 as usize] {
-            if target.color() == self.side_to_move { return false; }
-            if !m.is_capture() { return false; } // Must have capture flag
+            if target.color() == self.side_to_move {
+                return false;
+            }
+            if !m.is_capture() {
+                return false;
+            } // Must have capture flag
         } else {
-            if m.is_capture() && m.flag() != Move::FLAG_EP { return false; } // Must NOT have capture flag (unless EP)
+            if m.is_capture() && m.flag() != Move::FLAG_EP {
+                return false;
+            } // Must NOT have capture flag (unless EP)
         }
 
         let pt = piece.piece_type();
@@ -103,62 +117,153 @@ impl Board {
 
         if pt == PieceType::Pawn {
             let is_promo = to.rank() == 0 || to.rank() == 7;
-            if m.is_promotion() != is_promo { return false; }
+            if m.is_promotion() != is_promo {
+                return false;
+            }
 
             if m.flag() == Move::FLAG_EP {
-                if self.en_passant != Some(to) { return false; }
-                if (attacks::pawn_attacks(self.side_to_move, from).0 & (1 << to.0)) == 0 { return false; }
+                if self.en_passant != Some(to) {
+                    return false;
+                }
+                if (attacks::pawn_attacks(self.side_to_move, from).0 & (1 << to.0)) == 0 {
+                    return false;
+                }
                 return true;
             }
 
             if m.is_capture() {
-                if (attacks::pawn_attacks(self.side_to_move, from).0 & (1 << to.0)) == 0 { return false; }
+                if (attacks::pawn_attacks(self.side_to_move, from).0 & (1 << to.0)) == 0 {
+                    return false;
+                }
             } else {
                 if self.side_to_move == Color::White {
                     if to.0 == from.0 + 8 {
                     } else if to.0 == from.0 + 16 && from.rank() == 1 {
-                        if self.piece_on_sq[(from.0 + 8) as usize].is_some() { return false; }
-                        if m.flag() != Move::FLAG_DBL_PUSH { return false; }
-                    } else { return false; }
+                        if self.piece_on_sq[(from.0 + 8) as usize].is_some() {
+                            return false;
+                        }
+                        if m.flag() != Move::FLAG_DBL_PUSH {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
                 } else {
                     if to.0 == from.0 - 8 {
                     } else if to.0 == from.0 - 16 && from.rank() == 6 {
-                        if self.piece_on_sq[(from.0 - 8) as usize].is_some() { return false; }
-                        if m.flag() != Move::FLAG_DBL_PUSH { return false; }
-                    } else { return false; }
+                        if self.piece_on_sq[(from.0 - 8) as usize].is_some() {
+                            return false;
+                        }
+                        if m.flag() != Move::FLAG_DBL_PUSH {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
                 }
             }
         } else if pt == PieceType::Knight {
-            if (attacks::knight_attacks(from).0 & (1 << to.0)) == 0 { return false; }
-            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE { return false; }
+            if (attacks::knight_attacks(from).0 & (1 << to.0)) == 0 {
+                return false;
+            }
+            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE {
+                return false;
+            }
         } else if pt == PieceType::Bishop {
-            if (attacks::bishop_attacks(from, target_occ).0 & (1 << to.0)) == 0 { return false; }
-            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE { return false; }
+            if (attacks::bishop_attacks(from, target_occ).0 & (1 << to.0)) == 0 {
+                return false;
+            }
+            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE {
+                return false;
+            }
         } else if pt == PieceType::Rook {
-            if (attacks::rook_attacks(from, target_occ).0 & (1 << to.0)) == 0 { return false; }
-            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE { return false; }
+            if (attacks::rook_attacks(from, target_occ).0 & (1 << to.0)) == 0 {
+                return false;
+            }
+            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE {
+                return false;
+            }
         } else if pt == PieceType::Queen {
-            if (attacks::queen_attacks(from, target_occ).0 & (1 << to.0)) == 0 { return false; }
-            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE { return false; }
+            if (attacks::queen_attacks(from, target_occ).0 & (1 << to.0)) == 0 {
+                return false;
+            }
+            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE {
+                return false;
+            }
         } else if pt == PieceType::King {
             if m.flag() == Move::FLAG_K_CASTLE || m.flag() == Move::FLAG_Q_CASTLE {
                 if self.side_to_move == Color::White {
                     if m.flag() == Move::FLAG_K_CASTLE {
-                        if !self.castling.has_wk() || to.0 != 6 || (target_occ.0 & 0x60) != 0 { return false; }
+                        if !self.castling.has_wk() || to.0 != 6 || (target_occ.0 & 0x60) != 0 {
+                            return false;
+                        }
                     } else {
-                        if !self.castling.has_wq() || to.0 != 2 || (target_occ.0 & 0x0E) != 0 { return false; }
+                        if !self.castling.has_wq() || to.0 != 2 || (target_occ.0 & 0x0E) != 0 {
+                            return false;
+                        }
                     }
                 } else {
                     if m.flag() == Move::FLAG_K_CASTLE {
-                        if !self.castling.has_bk() || to.0 != 62 || (target_occ.0 & 0x6000000000000000) != 0 { return false; }
+                        if !self.castling.has_bk()
+                            || to.0 != 62
+                            || (target_occ.0 & 0x6000000000000000) != 0
+                        {
+                            return false;
+                        }
                     } else {
-                        if !self.castling.has_bq() || to.0 != 58 || (target_occ.0 & 0x0E00000000000000) != 0 { return false; }
+                        if !self.castling.has_bq()
+                            || to.0 != 58
+                            || (target_occ.0 & 0x0E00000000000000) != 0
+                        {
+                            return false;
+                        }
                     }
                 }
                 return true;
             }
-            if (attacks::king_attacks(from).0 & (1 << to.0)) == 0 { return false; }
-            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE { return false; }
+            if (attacks::king_attacks(from).0 & (1 << to.0)) == 0 {
+                return false;
+            }
+            if m.flag() != Move::FLAG_QUIET && m.flag() != Move::FLAG_CAPTURE {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn is_castling_legal(&self, m: Move) -> bool {
+        if m.flag() != Move::FLAG_K_CASTLE && m.flag() != Move::FLAG_Q_CASTLE {
+            return true;
+        }
+
+        let side = self.side_to_move;
+        let opp = side.flip();
+
+        let (king_from, king_to) = (m.from_sq(), m.to_sq());
+
+        // 1. Check if currently in check
+        let king_sq = Square::new(king_from);
+        if self.is_square_attacked(king_sq, opp) {
+            return false;
+        }
+
+        // 2. Check the passing square
+        let passing_sq = if king_to > king_from {
+            Square::new(king_from + 1)
+        } else {
+            Square::new(king_from - 1)
+        };
+
+        if self.is_square_attacked(passing_sq, opp) {
+            return false;
+        }
+
+        // 3. Final square is checked securely by the main legality check that comes AFTER make_move,
+        // but it doesn't hurt to check it here too for early pruning.
+        let dest_sq = Square::new(king_to);
+        if self.is_square_attacked(dest_sq, opp) {
+            return false;
         }
 
         true
@@ -169,11 +274,13 @@ impl Board {
         let mut black_features = [0; 32];
         let mut w_count = 0;
         let mut b_count = 0;
-        
+
         let wk_sq_opt = self.color_piece_bb(Color::White, PieceType::King).lsb();
         let bk_sq_opt = self.color_piece_bb(Color::Black, PieceType::King).lsb();
 
-        if wk_sq_opt == 64 || bk_sq_opt == 64 { return; } // Empty kings, invalid
+        if wk_sq_opt == 64 || bk_sq_opt == 64 {
+            return;
+        } // Empty kings, invalid
 
         let wk_sq = Square::new(wk_sq_opt);
         let bk_sq = Square::new(bk_sq_opt);
@@ -181,54 +288,67 @@ impl Board {
         for sq in 0..64 {
             if let Some(piece) = self.piece_on_sq[sq as usize] {
                 if piece.piece_type() != PieceType::King {
-                    white_features[w_count] = feature_index(wk_sq, Square::new(sq), piece.piece_type(), piece.color());
-                    black_features[b_count] = feature_index(bk_sq, Square::new(sq), piece.piece_type(), piece.color());
+                    white_features[w_count] =
+                        feature_index(wk_sq, Square::new(sq), piece.piece_type(), piece.color());
+                    black_features[b_count] =
+                        feature_index(bk_sq, Square::new(sq), piece.piece_type(), piece.color());
                     w_count += 1;
                     b_count += 1;
                 }
             }
         }
 
-        self.accumulator.refresh(&white_features[..w_count], &black_features[..b_count], &self.nnue.params);
+        self.accumulator.refresh(
+            &white_features[..w_count],
+            &black_features[..b_count],
+            &self.nnue.params,
+        );
     }
 
     pub fn compute_hash(&self) -> u64 {
         let mut h = 0;
-        
+
         for pt in 0..NUM_PIECE_TYPES {
             for color in [Color::White, Color::Black] {
-                let mut bb = self.color_piece_bb(color, match pt {
-                    0 => PieceType::Pawn,
-                    1 => PieceType::Knight,
-                    2 => PieceType::Bishop,
-                    3 => PieceType::Rook,
-                    4 => PieceType::Queen,
-                    5 => PieceType::King,
-                    _ => unreachable!()
-                });
-                while bb.is_not_empty() {
-                    let sq = Square::new(bb.pop_lsb());
-                    h ^= zobrist::piece_key(color, match pt {
+                let mut bb = self.color_piece_bb(
+                    color,
+                    match pt {
                         0 => PieceType::Pawn,
                         1 => PieceType::Knight,
                         2 => PieceType::Bishop,
                         3 => PieceType::Rook,
                         4 => PieceType::Queen,
                         5 => PieceType::King,
-                        _ => unreachable!()
-                    }, sq);
+                        _ => unreachable!(),
+                    },
+                );
+                while bb.is_not_empty() {
+                    let sq = Square::new(bb.pop_lsb());
+                    h ^= zobrist::piece_key(
+                        color,
+                        match pt {
+                            0 => PieceType::Pawn,
+                            1 => PieceType::Knight,
+                            2 => PieceType::Bishop,
+                            3 => PieceType::Rook,
+                            4 => PieceType::Queen,
+                            5 => PieceType::King,
+                            _ => unreachable!(),
+                        },
+                        sq,
+                    );
                 }
             }
         }
 
         if self.side_to_move == Color::Black {
-             h ^= zobrist::side_key();
+            h ^= zobrist::side_key();
         }
 
         h ^= zobrist::castling_key(self.castling);
 
         if let Some(ep) = self.en_passant {
-             h ^= zobrist::ep_key(ep);
+            h ^= zobrist::ep_key(ep);
         }
 
         h
@@ -254,10 +374,23 @@ impl Board {
         self.pieces[pt as usize] & self.colors[color as usize]
     }
 
+    pub fn non_pawn_material(&self, color: Color) -> i32 {
+        let mut mat = 0;
+        mat += self.color_piece_bb(color, PieceType::Knight).count() as i32
+            * crate::eval::PIECE_VALUES[PieceType::Knight as usize];
+        mat += self.color_piece_bb(color, PieceType::Bishop).count() as i32
+            * crate::eval::PIECE_VALUES[PieceType::Bishop as usize];
+        mat += self.color_piece_bb(color, PieceType::Rook).count() as i32
+            * crate::eval::PIECE_VALUES[PieceType::Rook as usize];
+        mat += self.color_piece_bb(color, PieceType::Queen).count() as i32
+            * crate::eval::PIECE_VALUES[PieceType::Queen as usize];
+        mat
+    }
+
     pub fn put_piece(&mut self, piece: Piece, sq: Square) {
         let pt = piece.piece_type();
         let color = piece.color();
-        
+
         self.pieces[pt as usize].set_bit(sq.0);
         self.colors[color as usize].set_bit(sq.0);
         self.piece_on_sq[sq.0 as usize] = Some(piece);
@@ -268,7 +401,7 @@ impl Board {
         if let Some(piece) = self.piece_on_sq[sq.0 as usize] {
             let pt = piece.piece_type();
             let color = piece.color();
-            
+
             self.pieces[pt as usize].clear_bit(sq.0);
             self.colors[color as usize].clear_bit(sq.0);
             self.piece_on_sq[sq.0 as usize] = None;
@@ -279,16 +412,19 @@ impl Board {
     pub fn make_move(&mut self, m: Move) -> UndoState {
         let from = Square::new(m.from_sq());
         let to = Square::new(m.to_sq());
-        
+
         let moving_piece = match self.piece_on_sq[from.0 as usize] {
             Some(p) => p,
             None => {
-                panic!("WARNING: make_move called but no piece on from_sq={} for move {:?}", from.0, m);
+                panic!(
+                    "WARNING: make_move called but no piece on from_sq={} for move {:?}",
+                    from.0, m
+                );
             }
         };
         let color = moving_piece.color();
         let pt = moving_piece.piece_type();
-        
+
         let captured_piece = self.piece_on_sq[to.0 as usize].map(|p| p.piece_type());
 
         let undo = UndoState {
@@ -325,24 +461,27 @@ impl Board {
         if pt != PieceType::King {
             let rm_w = feature_index(wk_sq, from, pt, color);
             let rm_b = feature_index(bk_sq, from, pt, color);
-            self.accumulator.remove_feature(rm_w, rm_b, &self.nnue.params);
-            
+            self.accumulator
+                .remove_feature(rm_w, rm_b, &self.nnue.params);
+
             let add_w = feature_index(wk_sq, to, pt, color);
             let add_b = feature_index(bk_sq, to, pt, color);
-            self.accumulator.add_feature(add_w, add_b, &self.nnue.params);
+            self.accumulator
+                .add_feature(add_w, add_b, &self.nnue.params);
         }
 
         self.remove_piece(from);
-        
+
         if let Some(c_pt) = captured_piece {
             if c_pt != PieceType::King {
                 let rmc_w = feature_index(wk_sq, to, c_pt, color.flip());
                 let rmc_b = feature_index(bk_sq, to, c_pt, color.flip());
-                self.accumulator.remove_feature(rmc_w, rmc_b, &self.nnue.params);
+                self.accumulator
+                    .remove_feature(rmc_w, rmc_b, &self.nnue.params);
             }
             self.remove_piece(to);
         }
-        
+
         self.put_piece(moving_piece, to);
 
         // Handle special moves
@@ -353,11 +492,12 @@ impl Board {
             } else {
                 Square::new(to.0 + 8)
             };
-            
+
             // Remove captured ET pawn from NNUE
             let rme_w = feature_index(wk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
             let rme_b = feature_index(bk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
-            self.accumulator.remove_feature(rme_w, rme_b, &self.nnue.params);
+            self.accumulator
+                .remove_feature(rme_w, rme_b, &self.nnue.params);
 
             self.remove_piece(ep_cap_sq);
         } else if m.flag() == Move::FLAG_DBL_PUSH {
@@ -388,15 +528,17 @@ impl Board {
                     panic!("WARNING: make_move castling but no rook on rook_from={} (m={:?}, history={})", rook_from.0, m, self.position_history.len());
                 }
             };
-            
+
             // NNUE incremental update for castled rook
             let rmr_w = feature_index(wk_sq, rook_from, PieceType::Rook, color);
             let rmr_b = feature_index(bk_sq, rook_from, PieceType::Rook, color);
-            self.accumulator.remove_feature(rmr_w, rmr_b, &self.nnue.params);
-            
+            self.accumulator
+                .remove_feature(rmr_w, rmr_b, &self.nnue.params);
+
             let addr_w = feature_index(wk_sq, rook_to, PieceType::Rook, color);
             let addr_b = feature_index(bk_sq, rook_to, PieceType::Rook, color);
-            self.accumulator.add_feature(addr_w, addr_b, &self.nnue.params);
+            self.accumulator
+                .add_feature(addr_w, addr_b, &self.nnue.params);
 
             self.remove_piece(rook_from);
             self.put_piece(rook, rook_to);
@@ -405,15 +547,17 @@ impl Board {
         // Promotions
         if m.is_promotion() {
             let promo_pt = m.promotion_type();
-            
+
             // Fix NNUE promotion override: Replace the inserted pawn with the promoted piece
             let rmp_w = feature_index(wk_sq, to, PieceType::Pawn, color);
             let rmp_b = feature_index(bk_sq, to, PieceType::Pawn, color);
-            self.accumulator.remove_feature(rmp_w, rmp_b, &self.nnue.params);
+            self.accumulator
+                .remove_feature(rmp_w, rmp_b, &self.nnue.params);
 
             let addp_w = feature_index(wk_sq, to, promo_pt, color);
             let addp_b = feature_index(bk_sq, to, promo_pt, color);
-            self.accumulator.add_feature(addp_w, addp_b, &self.nnue.params);
+            self.accumulator
+                .add_feature(addp_w, addp_b, &self.nnue.params);
 
             self.remove_piece(to);
             self.put_piece(Piece::new(color, promo_pt), to);
@@ -444,7 +588,7 @@ impl Board {
     pub fn unmake_move(&mut self, m: Move, undo: &UndoState) {
         let from = Square::new(m.from_sq());
         let to = Square::new(m.to_sq());
-        
+
         self.side_to_move = self.side_to_move.flip();
         if self.side_to_move == Color::Black {
             self.fullmove_number -= 1;
@@ -453,7 +597,10 @@ impl Board {
         let moved_piece = match self.piece_on_sq[to.0 as usize] {
             Some(p) => p,
             None => {
-                panic!("WARNING: unmake_move called but no piece on to_sq={} for move {:?}", to.0, m);
+                panic!(
+                    "WARNING: unmake_move called but no piece on to_sq={} for move {:?}",
+                    to.0, m
+                );
             }
         };
         let color = moved_piece.color();
@@ -461,8 +608,12 @@ impl Board {
 
         // Standard unmake step 1: Move piece back
         self.remove_piece(to);
-        
-        let orig_pt = if m.is_promotion() { PieceType::Pawn } else { pt };
+
+        let orig_pt = if m.is_promotion() {
+            PieceType::Pawn
+        } else {
+            pt
+        };
         self.put_piece(Piece::new(color, orig_pt), from);
 
         // Step 2: Handle captures (including en passant)
@@ -494,7 +645,10 @@ impl Board {
             let rook = match self.piece_on_sq[rook_to.0 as usize] {
                 Some(r) => r,
                 None => {
-                    panic!("WARNING: unmake castling but no rook on rook_to={}", rook_to.0);
+                    panic!(
+                        "WARNING: unmake castling but no rook on rook_to={}",
+                        rook_to.0
+                    );
                 }
             };
             self.remove_piece(rook_to);
@@ -505,7 +659,7 @@ impl Board {
         self.castling = undo.castling;
         self.halfmove_clock = undo.halfmove_clock;
         self.zobrist_key = undo.zobrist_key;
-        
+
         // Restore NNUE Accumulator instantly in O(1) time
         self.accumulator = undo.accumulator.clone();
         self.position_history.pop();
@@ -528,7 +682,7 @@ impl Board {
 
         self.side_to_move = self.side_to_move.flip();
         self.zobrist_key ^= zobrist::side_key();
-        
+
         undo
     }
 
@@ -538,13 +692,13 @@ impl Board {
         self.castling = undo.castling;
         self.halfmove_clock = undo.halfmove_clock;
         self.zobrist_key = undo.zobrist_key;
-        
+
         // Accumulator is unchanged by null move, no need to restore
     }
 
     pub fn is_square_attacked(&self, sq: Square, by_color: Color) -> bool {
         use crate::attacks;
-        
+
         let occ = self.occupancies();
 
         // Check pawn attacks
@@ -566,12 +720,14 @@ impl Board {
         }
 
         // Check slider attacks (Bishop, Rook, Queen)
-        let bishops_queens = self.color_piece_bb(by_color, PieceType::Bishop) | self.color_piece_bb(by_color, PieceType::Queen);
+        let bishops_queens = self.color_piece_bb(by_color, PieceType::Bishop)
+            | self.color_piece_bb(by_color, PieceType::Queen);
         if (attacks::bishop_attacks(sq, occ) & bishops_queens).is_not_empty() {
             return true;
         }
 
-        let rooks_queens = self.color_piece_bb(by_color, PieceType::Rook) | self.color_piece_bb(by_color, PieceType::Queen);
+        let rooks_queens = self.color_piece_bb(by_color, PieceType::Rook)
+            | self.color_piece_bb(by_color, PieceType::Queen);
         if (attacks::rook_attacks(sq, occ) & rooks_queens).is_not_empty() {
             return true;
         }
@@ -597,19 +753,23 @@ impl Board {
         use crate::attacks;
         let mut attackers = Bitboard::EMPTY;
 
-        attackers |= attacks::pawn_attacks(Color::Black, sq) & self.color_piece_bb(Color::White, PieceType::Pawn);
-        attackers |= attacks::pawn_attacks(Color::White, sq) & self.color_piece_bb(Color::Black, PieceType::Pawn);
+        attackers |= attacks::pawn_attacks(Color::Black, sq)
+            & self.color_piece_bb(Color::White, PieceType::Pawn);
+        attackers |= attacks::pawn_attacks(Color::White, sq)
+            & self.color_piece_bb(Color::Black, PieceType::Pawn);
         attackers |= attacks::knight_attacks(sq) & self.piece_bb(PieceType::Knight);
         attackers |= attacks::king_attacks(sq) & self.piece_bb(PieceType::King);
-        attackers |= attacks::bishop_attacks(sq, occ) & (self.piece_bb(PieceType::Bishop) | self.piece_bb(PieceType::Queen));
-        attackers |= attacks::rook_attacks(sq, occ) & (self.piece_bb(PieceType::Rook) | self.piece_bb(PieceType::Queen));
+        attackers |= attacks::bishop_attacks(sq, occ)
+            & (self.piece_bb(PieceType::Bishop) | self.piece_bb(PieceType::Queen));
+        attackers |= attacks::rook_attacks(sq, occ)
+            & (self.piece_bb(PieceType::Rook) | self.piece_bb(PieceType::Queen));
 
         attackers
     }
 
     pub fn see_ge(&self, m: Move, threshold: i32) -> bool {
         use crate::types::SEE_PIECE_VALUES;
-        
+
         let from = Square::new(m.from_sq());
         let to = Square::new(m.to_sq());
 
@@ -622,29 +782,43 @@ impl Board {
             }
         };
 
-        if swap < 0 { return false; }
+        if swap < 0 {
+            return false;
+        }
 
         let moving_piece = match self.piece_on_sq[from.0 as usize] {
             Some(p) => p.piece_type(),
             None => return false, // No piece on from — treat as bad SEE
         };
         swap = SEE_PIECE_VALUES[moving_piece as usize] - swap;
-        if swap <= 0 { return true; }
+        if swap <= 0 {
+            return true;
+        }
 
-        let mut occupied = self.occupancies() ^ Bitboard::new(1u64 << from.0) ^ Bitboard::new(1u64 << to.0);
+        let mut occupied =
+            self.occupancies() ^ Bitboard::new(1u64 << from.0) ^ Bitboard::new(1u64 << to.0);
         let mut attackers = self.attackers_to(to, occupied);
         let mut stm = self.side_to_move.flip();
-        
+
         let mut res = 1;
-        
+
         loop {
             let stm_attackers = attackers & self.color_occupancy(stm);
-            if stm_attackers.is_empty() { break; }
-            
+            if stm_attackers.is_empty() {
+                break;
+            }
+
             let mut attacker_sq = 64;
             let mut attacker_pt = PieceType::King;
-            
-            for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King] {
+
+            for pt in [
+                PieceType::Pawn,
+                PieceType::Knight,
+                PieceType::Bishop,
+                PieceType::Rook,
+                PieceType::Queen,
+                PieceType::King,
+            ] {
                 let pt_attackers = stm_attackers & self.piece_bb(pt);
                 if pt_attackers.is_not_empty() {
                     attacker_sq = pt_attackers.lsb();
@@ -652,34 +826,43 @@ impl Board {
                     break;
                 }
             }
-            
+
             if attacker_pt == PieceType::King {
                 return (attackers & self.color_occupancy(stm.flip())).is_empty() == (res != 0);
             }
-            
+
             res ^= 1;
             swap = SEE_PIECE_VALUES[attacker_pt as usize] - swap;
-            if swap < res { break; }
-            
+            if swap < res {
+                break;
+            }
+
             occupied ^= Bitboard::new(1u64 << attacker_sq);
-            if attacker_pt == PieceType::Pawn || attacker_pt == PieceType::Bishop || attacker_pt == PieceType::Queen {
-                attackers |= crate::attacks::bishop_attacks(to, occupied) & (self.piece_bb(PieceType::Bishop) | self.piece_bb(PieceType::Queen));
+            if attacker_pt == PieceType::Pawn
+                || attacker_pt == PieceType::Bishop
+                || attacker_pt == PieceType::Queen
+            {
+                attackers |= crate::attacks::bishop_attacks(to, occupied)
+                    & (self.piece_bb(PieceType::Bishop) | self.piece_bb(PieceType::Queen));
             }
             if attacker_pt == PieceType::Rook || attacker_pt == PieceType::Queen {
-                attackers |= crate::attacks::rook_attacks(to, occupied) & (self.piece_bb(PieceType::Rook) | self.piece_bb(PieceType::Queen));
+                attackers |= crate::attacks::rook_attacks(to, occupied)
+                    & (self.piece_bb(PieceType::Rook) | self.piece_bb(PieceType::Queen));
             }
-            
+
             attackers &= occupied;
             stm = stm.flip();
         }
-        
+
         res != 0
     }
 
     pub fn from_fen(fen: &str, nnue: std::sync::Arc<crate::nnue::NNUE>) -> Option<Self> {
         let mut board = Board::empty(nnue);
         let parts: Vec<&str> = fen.split_whitespace().collect();
-        if parts.len() < 4 { return None; }
+        if parts.len() < 4 {
+            return None;
+        }
 
         let mut rank = 7_i32;
         let mut file = 0_i32;
@@ -689,10 +872,14 @@ impl Board {
             if ch == '/' {
                 rank -= 1;
                 file = 0;
-            } else if ch.is_digit(10) {
+            } else if ch.is_ascii_digit() {
                 file += ch.to_digit(10).unwrap() as i32;
             } else {
-                let color = if ch.is_uppercase() { Color::White } else { Color::Black };
+                let color = if ch.is_uppercase() {
+                    Color::White
+                } else {
+                    Color::Black
+                };
                 let pt = match ch.to_ascii_lowercase() {
                     'p' => PieceType::Pawn,
                     'n' => PieceType::Knight,
@@ -709,7 +896,11 @@ impl Board {
         }
 
         // 2. Side to move
-        board.side_to_move = if parts[1] == "w" { Color::White } else { Color::Black };
+        board.side_to_move = if parts[1] == "w" {
+            Color::White
+        } else {
+            Color::Black
+        };
         if board.side_to_move == Color::Black {
             board.zobrist_key ^= zobrist::side_key();
         }

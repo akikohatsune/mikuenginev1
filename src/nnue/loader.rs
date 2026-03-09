@@ -1,10 +1,9 @@
+use std::fs::File;
 /// NNUE Network Parameters and Binary Loader
-/// 
+///
 /// Parses Stockfish-compatible .nnue files in little-endian format.
 /// Network architecture: HalfKP → FT(256) → L1(32) → L2(32) → Output(1)
-
-use std::io::{self, Read, BufReader};
-use std::fs::File;
+use std::io::{self, BufReader, Read};
 
 use super::feature::{HALFKP_FEATURES, TRANSFORMED_SIZE};
 
@@ -18,19 +17,25 @@ pub struct NetworkParams {
     pub ft_weight: Vec<i8>,
     // Feature Transformer bias: TRANSFORMED_SIZE values (i16)
     pub ft_bias: [i16; TRANSFORMED_SIZE],
-    
+
     // Layer 1: (2 * TRANSFORMED_SIZE) → L1_SIZE
     // Input is concatenation of [white_acc, black_acc] = 512 values
     pub l1_weight: [[i8; 512]; L1_SIZE],
     pub l1_bias: [i32; L1_SIZE],
-    
-    // Layer 2: L1_SIZE → L2_SIZE  
+
+    // Layer 2: L1_SIZE → L2_SIZE
     pub l2_weight: [[i8; L1_SIZE]; L2_SIZE],
     pub l2_bias: [i32; L2_SIZE],
-    
+
     // Output: L2_SIZE → 1
     pub out_weight: [i8; L2_SIZE],
     pub out_bias: i32,
+}
+
+impl Default for NetworkParams {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NetworkParams {
@@ -58,7 +63,7 @@ impl NetworkParams {
         // Magic: 4 bytes (version), Description: skip variable length
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        
+
         // Read description length + description (null-terminated string marker)
         // Stockfish NNUE format: after magic, there's a hash, then architecture description
         let mut hash = [0u8; 4];
@@ -68,7 +73,7 @@ impl NetworkParams {
         let mut desc_size_buf = [0u8; 4];
         reader.read_exact(&mut desc_size_buf)?;
         let desc_size = u32::from_le_bytes(desc_size_buf) as usize;
-        
+
         // Skip description
         let mut desc = vec![0u8; desc_size];
         reader.read_exact(&mut desc)?;
@@ -81,7 +86,7 @@ impl NetworkParams {
         let mut bias_buf = [0u8; TRANSFORMED_SIZE * 2];
         reader.read_exact(&mut bias_buf)?;
         for i in 0..TRANSFORMED_SIZE {
-            params.ft_bias[i] = i16::from_le_bytes([bias_buf[i*2], bias_buf[i*2+1]]);
+            params.ft_bias[i] = i16::from_le_bytes([bias_buf[i * 2], bias_buf[i * 2 + 1]]);
         }
 
         // FT Weights: HALFKP_FEATURES * TRANSFORMED_SIZE bytes (i8)

@@ -1,8 +1,8 @@
 use crate::board::Board;
-use crate::types::{Move, PieceType, Square};
-use crate::movegen::{MoveList, generate_pseudo_legal_moves};
-use crate::history::Heuristics;
 use crate::eval::PIECE_VALUES;
+use crate::history::Heuristics;
+use crate::movegen::{generate_pseudo_legal_moves, MoveList};
+use crate::types::{Move, PieceType, Square};
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum MovePickerStage {
@@ -27,11 +27,11 @@ pub struct MovePicker {
     ply: usize,
     stage: MovePickerStage,
     quiescence: bool,
-    
+
     list: MoveList,
     scores: [i32; 256],
     cur: usize,
-    
+
     bad_captures: [Move; 256],
     bad_captures_count: usize,
     bad_quiets: [Move; 256],
@@ -39,8 +39,18 @@ pub struct MovePicker {
 }
 
 impl MovePicker {
-    pub fn new(tt_move: Option<Move>, ply: usize, counter_move: Option<Move>, quiescence: bool, in_check: bool) -> Self {
-        let stage = if in_check { MovePickerStage::EvasionTT } else { MovePickerStage::TTMove };
+    pub fn new(
+        tt_move: Option<Move>,
+        ply: usize,
+        counter_move: Option<Move>,
+        quiescence: bool,
+        in_check: bool,
+    ) -> Self {
+        let stage = if in_check {
+            MovePickerStage::EvasionTT
+        } else {
+            MovePickerStage::TTMove
+        };
         MovePicker {
             tt_move,
             counter_move,
@@ -83,7 +93,7 @@ impl MovePicker {
                         if self.is_tt_move(m) {
                             continue;
                         }
-                        
+
                         if board.see_ge(m, 0) {
                             return Some(m);
                         } else {
@@ -103,7 +113,11 @@ impl MovePicker {
                     if self.cur < 2 {
                         let killer = heuristics.killers[self.ply][self.cur];
                         self.cur += 1;
-                        if killer.0 != 0 && !self.is_tt_move(killer) && board.is_pseudo_legal(killer) && !killer.is_capture() {
+                        if killer.0 != 0
+                            && !self.is_tt_move(killer)
+                            && board.is_pseudo_legal(killer)
+                            && !killer.is_capture()
+                        {
                             return Some(killer);
                         }
                         continue;
@@ -113,7 +127,11 @@ impl MovePicker {
                 MovePickerStage::CounterMove => {
                     self.stage = MovePickerStage::QuietsInit;
                     if let Some(cm) = self.counter_move {
-                        if !self.is_tt_move(cm) && !self.is_killer_move(heuristics, cm) && board.is_pseudo_legal(cm) && !cm.is_capture() {
+                        if !self.is_tt_move(cm)
+                            && !self.is_killer_move(heuristics, cm)
+                            && board.is_pseudo_legal(cm)
+                            && !cm.is_capture()
+                        {
                             return Some(cm);
                         }
                     }
@@ -128,10 +146,13 @@ impl MovePicker {
                         if m.is_capture() || m.is_promotion() {
                             continue;
                         }
-                        if self.is_tt_move(m) || self.is_killer_move(heuristics, m) || self.is_counter_move(m) {
+                        if self.is_tt_move(m)
+                            || self.is_killer_move(heuristics, m)
+                            || self.is_counter_move(m)
+                        {
                             continue;
                         }
-                        
+
                         let score = self.scores[self.cur - 1];
                         if score > -14000 {
                             return Some(m);
@@ -178,7 +199,9 @@ impl MovePicker {
                 }
                 MovePickerStage::Evasions => {
                     if let Some(m) = self.get_next_scored_move() {
-                        if self.is_tt_move(m) { continue; }
+                        if self.is_tt_move(m) {
+                            continue;
+                        }
                         return Some(m);
                     }
                     self.stage = MovePickerStage::AllDone;
@@ -195,16 +218,24 @@ impl MovePicker {
                 let to_sq = m.to_sq();
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
                     Some(p) => p.piece_type(),
-                    None => { self.scores[i] = -20_000_000; continue; }
+                    None => {
+                        self.scores[i] = -20_000_000;
+                        continue;
+                    }
                 };
                 let victim_pt = if m.is_en_passant() {
                     PieceType::Pawn
                 } else {
-                    board.piece_on_sq[to_sq as usize].map(|p| p.piece_type()).unwrap_or(PieceType::Pawn)
+                    board.piece_on_sq[to_sq as usize]
+                        .map(|p| p.piece_type())
+                        .unwrap_or(PieceType::Pawn)
                 };
-                
-                let cap_hist = heuristics.get_capture_history(attacker_pt, Square::new(to_sq), victim_pt);
-                self.scores[i] = 10_000_000 + PIECE_VALUES[victim_pt as usize] * 10 - PIECE_VALUES[attacker_pt as usize] + cap_hist / 32;
+
+                let cap_hist =
+                    heuristics.get_capture_history(attacker_pt, Square::new(to_sq), victim_pt);
+                self.scores[i] = 10_000_000 + PIECE_VALUES[victim_pt as usize] * 10
+                    - PIECE_VALUES[attacker_pt as usize]
+                    + cap_hist / 32;
             } else {
                 self.scores[i] = -20_000_000; // Low priority
             }
@@ -214,35 +245,67 @@ impl MovePicker {
 
     fn score_quiets(&mut self, heuristics: &Heuristics, board: &Board) {
         let side = board.side_to_move;
-        
+
         let opp_king_bb = board.piece_bb(PieceType::King) & board.color_occupancy(side.flip());
-        let opp_king_sq = if opp_king_bb.is_not_empty() { Some(Square::new(opp_king_bb.lsb())) } else { None };
+        let opp_king_sq = if opp_king_bb.is_not_empty() {
+            Some(Square::new(opp_king_bb.lsb()))
+        } else {
+            None
+        };
 
         for i in 0..self.list.count {
             let m = self.list.moves[i];
             if !m.is_capture() && !m.is_promotion() {
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
                     Some(p) => p.piece_type(),
-                    None => { self.scores[i] = -20_000_000; continue; }
+                    None => {
+                        self.scores[i] = -20_000_000;
+                        continue;
+                    }
                 };
                 let mut h = heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
-                
+
                 if let Some(king_sq) = opp_king_sq {
                     let to = Square::new(m.to_sq());
                     let occ_after = (board.occupancies().0 & !(1 << m.from_sq())) | (1 << to.0);
                     let gives_check = match attacker_pt {
-                        PieceType::Knight => (crate::attacks::knight_attacks(to).0 & (1<<king_sq.0)) != 0,
-                        PieceType::Bishop => (crate::attacks::bishop_attacks(to, crate::bitboard::Bitboard::new(occ_after)).0 & (1<<king_sq.0)) != 0,
-                        PieceType::Rook => (crate::attacks::rook_attacks(to, crate::bitboard::Bitboard::new(occ_after)).0 & (1<<king_sq.0)) != 0,
-                        PieceType::Queen => (crate::attacks::queen_attacks(to, crate::bitboard::Bitboard::new(occ_after)).0 & (1<<king_sq.0)) != 0,
-                        PieceType::Pawn => (crate::attacks::pawn_attacks(side, to).0 & (1<<king_sq.0)) != 0,
+                        PieceType::Knight => {
+                            (crate::attacks::knight_attacks(to).0 & (1 << king_sq.0)) != 0
+                        }
+                        PieceType::Bishop => {
+                            (crate::attacks::bishop_attacks(
+                                to,
+                                crate::bitboard::Bitboard::new(occ_after),
+                            )
+                            .0 & (1 << king_sq.0))
+                                != 0
+                        }
+                        PieceType::Rook => {
+                            (crate::attacks::rook_attacks(
+                                to,
+                                crate::bitboard::Bitboard::new(occ_after),
+                            )
+                            .0 & (1 << king_sq.0))
+                                != 0
+                        }
+                        PieceType::Queen => {
+                            (crate::attacks::queen_attacks(
+                                to,
+                                crate::bitboard::Bitboard::new(occ_after),
+                            )
+                            .0 & (1 << king_sq.0))
+                                != 0
+                        }
+                        PieceType::Pawn => {
+                            (crate::attacks::pawn_attacks(side, to).0 & (1 << king_sq.0)) != 0
+                        }
                         _ => false,
                     };
                     if gives_check {
                         h += 16384;
                     }
                 }
-                
+
                 // Optimization: could add continuation history here if available
                 self.scores[i] = h;
             } else {
@@ -260,19 +323,27 @@ impl MovePicker {
                 let to_sq = m.to_sq();
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
                     Some(p) => p.piece_type(),
-                    None => { self.scores[i] = -20_000_000; continue; }
+                    None => {
+                        self.scores[i] = -20_000_000;
+                        continue;
+                    }
                 };
                 let victim_pt = if m.is_en_passant() {
                     PieceType::Pawn
                 } else {
-                    board.piece_on_sq[to_sq as usize].map(|p| p.piece_type()).unwrap_or(PieceType::Pawn)
+                    board.piece_on_sq[to_sq as usize]
+                        .map(|p| p.piece_type())
+                        .unwrap_or(PieceType::Pawn)
                 };
-                let cap_hist = heuristics.get_capture_history(attacker_pt, Square::new(to_sq), victim_pt);
-                self.scores[i] = 10_000_000 + PIECE_VALUES[victim_pt as usize] * 10 - PIECE_VALUES[attacker_pt as usize] + cap_hist / 32;
+                let cap_hist =
+                    heuristics.get_capture_history(attacker_pt, Square::new(to_sq), victim_pt);
+                self.scores[i] = 10_000_000 + PIECE_VALUES[victim_pt as usize] * 10
+                    - PIECE_VALUES[attacker_pt as usize]
+                    + cap_hist / 32;
             } else {
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
                     Some(p) => p.piece_type(),
-                    None => PieceType::Pawn
+                    None => PieceType::Pawn,
                 };
                 self.scores[i] = heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
             }

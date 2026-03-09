@@ -43,7 +43,11 @@ impl Piece {
 
     #[inline(always)]
     pub fn color(self) -> Color {
-        if self.0 < 6 { Color::White } else { Color::Black }
+        if self.0 < 6 {
+            Color::White
+        } else {
+            Color::Black
+        }
     }
 
     #[inline(always)]
@@ -171,12 +175,12 @@ impl fmt::Debug for Move {
         let ranks = b"12345678";
         let from = self.from_sq();
         let to = self.to_sq();
-        
+
         let from_file = files[(from % 8) as usize] as char;
         let from_rank = ranks[(from / 8) as usize] as char;
         let to_file = files[(to % 8) as usize] as char;
         let to_rank = ranks[(to / 8) as usize] as char;
-        
+
         write!(f, "{}{}{}{}", from_file, from_rank, to_file, to_rank)
     }
 }
@@ -197,14 +201,22 @@ impl CastlingRights {
     }
 
     #[inline(always)]
-    pub fn has_wk(self) -> bool { (self.0 & Self::WK) != 0 }
-    
+    pub fn has_wk(self) -> bool {
+        (self.0 & Self::WK) != 0
+    }
+
     #[inline(always)]
-    pub fn has_wq(self) -> bool { (self.0 & Self::WQ) != 0 }
-    
+    pub fn has_wq(self) -> bool {
+        (self.0 & Self::WQ) != 0
+    }
+
     #[inline(always)]
-    pub fn has_bk(self) -> bool { (self.0 & Self::BK) != 0 }
-    
+    pub fn has_bk(self) -> bool {
+        (self.0 & Self::BK) != 0
+    }
+
     #[inline(always)]
-    pub fn has_bq(self) -> bool { (self.0 & Self::BQ) != 0 }
+    pub fn has_bq(self) -> bool {
+        (self.0 & Self::BQ) != 0
+    }
 }

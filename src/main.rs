@@ -1,21 +1,21 @@
-pub mod types;
-pub mod bitboard;
-pub mod zobrist;
-pub mod board;
 pub mod attacks;
-pub mod movegen;
-pub mod perft;
+pub mod bitboard;
+pub mod board;
 pub mod eval;
-pub mod transposition;
 pub mod history;
+pub mod movegen;
 pub mod movepick;
-pub mod search;
-pub mod uci;
 pub mod nnue;
+pub mod perft;
+pub mod search;
+pub mod transposition;
+pub mod types;
+pub mod uci;
+pub mod zobrist;
 
 use std::env;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn find_nnue_file() -> Option<PathBuf> {
     // 1. Tìm cạnh file exe
@@ -86,7 +86,11 @@ fn main() {
     };
 
     if args.len() > 1 && args[1] == "perft" {
-        let depth = if args.len() > 2 { args[2].parse().unwrap_or(5) } else { 5 };
+        let depth = if args.len() > 2 {
+            args[2].parse().unwrap_or(5)
+        } else {
+            5
+        };
         let mut board = board::Board::new(nnue.clone());
         perft::divide(&mut board, depth);
     } else {

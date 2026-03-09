@@ -1,3 +1,4 @@
+pub mod accumulator;
 /// NNUE Evaluation Module
 ///
 /// Sub-modules:
@@ -7,11 +8,9 @@
 ///   inference   — forward pass with clipped ReLU
 ///   incremental — delta-based incremental update helpers
 ///   simd        — AVX2 acceleration for linear layers
-
 pub mod feature;
-pub mod accumulator;
-pub mod inference;
 pub mod incremental;
+pub mod inference;
 pub mod simd;
 
 /// Network parameters module (loader.rs contains NetworkParams)

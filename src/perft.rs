@@ -10,14 +10,20 @@ pub fn perft(board: &mut Board, depth: u8) -> u64 {
     generate_pseudo_legal_moves(board, &mut list);
 
     let mut nodes = 0;
-    
+
     for i in 0..list.count {
         let m = list.moves[i];
+
+        if !board.is_castling_legal(m) {
+            continue;
+        }
+
         let undo = board.make_move(m);
 
         let side = board.side_to_move.flip();
-        let king_sq_opt = board.piece_bb(crate::types::PieceType::King) & board.color_occupancy(side);
-        
+        let king_sq_opt =
+            board.piece_bb(crate::types::PieceType::King) & board.color_occupancy(side);
+
         if king_sq_opt.is_not_empty() {
             let king_sq = crate::types::Square::new(king_sq_opt.lsb());
             // is_square_attacked needs to check if king is attacked by current side_to_move
@@ -45,11 +51,17 @@ pub fn divide(board: &mut Board, depth: u8) {
 
     for i in 0..list.count {
         let m = list.moves[i];
+
+        if !board.is_castling_legal(m) {
+            continue;
+        }
+
         let undo = board.make_move(m);
 
         let side = board.side_to_move.flip();
-        let king_sq_opt = board.piece_bb(crate::types::PieceType::King) & board.color_occupancy(side);
-        
+        let king_sq_opt =
+            board.piece_bb(crate::types::PieceType::King) & board.color_occupancy(side);
+
         if king_sq_opt.is_not_empty() {
             let king_sq = crate::types::Square::new(king_sq_opt.lsb());
             if !board.is_square_attacked(king_sq, board.side_to_move) {

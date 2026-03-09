@@ -5,8 +5,8 @@ Techniques to add incrementally. Check off as implemented.
 ## Medium Priority (Phase 3)
 
 
-- [ ] **Futility w/ correction history** — margin adjusted by `abs(correctionValue) / 174665`
-- [ ] **cutoffCnt LMR boost** — `+256 + 1024*(cnt>2) + 1024*allNode` based on child cutoffs
-- [ ] **Fail-low counter bonus** — complex bonus based on statScore, depth, moveCount
-- [ ] **Non-pawn correction** — White/Black non-pawn material keys
-- [ ] **Continuation correction** — `continuationCorrectionHistory[piece][to]` for ply-2 and ply-4
+- [x] **Futility w/ correction history** — margin adjusted by `abs(correctionValue) / 174665`
+- [x] **cutoffCnt LMR boost** — `+256 + 1024*(cnt>2) + 1024*allNode` based on child cutoffs
+- [x] **Fail-low counter bonus** — complex bonus based on statScore, depth, moveCount
+- [x] **Non-pawn correction** — White/Black non-pawn material keys
+- [x] **Continuation correction** — `continuationCorrectionHistory[piece][to]` for ply-2 and ply-4
