@@ -7,6 +7,7 @@ use crate::types::{Color, PieceType};
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crate::smp::SharedState;
 
 pub fn uci_loop(nnue: Arc<NNUE>) {
     let stdin = io::stdin();
@@ -201,36 +202,21 @@ fn parse_go(
         i += 1;
     }
 
-    let mut final_soft_limit = std::time::Duration::from_secs(u64::MAX);
-    let mut final_hard_limit = std::time::Duration::from_secs(u64::MAX);
+    let mut timer = crate::time::TimeManager::new();
 
     if movetime > 0 {
-        final_soft_limit =
-            std::time::Duration::from_millis((movetime as u64).saturating_sub(50).max(1));
-        final_hard_limit =
-            std::time::Duration::from_millis((movetime as u64).saturating_sub(10).max(1));
+        timer.set_exact_limits(movetime as u128, movetime as u128);
         depth = 64;
     } else if (wtime > 0 && board.side_to_move == Color::White)
         || (btime > 0 && board.side_to_move == Color::Black)
     {
         let (time, inc) = if board.side_to_move == Color::White {
-            (wtime as u64, winc as u64)
+            (wtime as u128, winc as u128)
         } else {
-            (btime as u64, binc as u64)
+            (btime as u128, binc as u128)
         };
 
-        let base_time = time / 30;
-        let increment_bonus = inc / 2;
-        let move_time = ((base_time + increment_bonus) * 9) / 10;
-
-        let mut allocated = move_time;
-        if allocated > time {
-            allocated = time / 10;
-        }
-
-        final_soft_limit = std::time::Duration::from_millis(allocated.saturating_sub(50).max(10));
-        final_hard_limit =
-            std::time::Duration::from_millis((allocated * 3).min(time.saturating_sub(50)).max(10));
+        timer.init(time, inc, board.fullmove_number as usize);
         depth = 64;
     }
 
@@ -239,13 +225,22 @@ fn parse_go(
         .stack_size(8 * 1024 * 1024)
         .name("uci_supervisor".to_string())
         .spawn(move || {
+            let mut root_moves = MoveList::new();
+            generate_pseudo_legal_moves(&board, &mut root_moves);
+            let mut move_vec = Vec::with_capacity(root_moves.count);
+            for i in 0..root_moves.count {
+                if board.is_pseudo_legal(root_moves.moves[i]) {
+                    move_vec.push(root_moves.moves[i]);
+                }
+            }
+            let shared_state = Arc::new(SharedState::new(tt.clone(), stop.clone(), move_vec));
+
             let mut workers = vec![];
 
             for t_id in 0..num_threads {
-                // Each thread gets its own Search state and Heuristics, but shares TT and stop.
-                let mut search = Box::new(Search::new(tt.clone(), stop.clone(), t_id));
-                search.soft_limit = final_soft_limit;
-                search.hard_limit = final_hard_limit;
+                // Each thread gets its own Search state and Heuristics, but shares TT and stop via SharedState.
+                let mut search = Box::new(Search::new(shared_state.clone(), t_id));
+                search.timer = timer.clone();
                 let mut worker_board = board.clone();
 
                 let handle = std::thread::Builder::new()

@@ -1,12 +1,13 @@
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::history::Heuristics;
-use crate::movegen::{generate_pseudo_legal_moves, MoveList};
+use crate::movegen::{generate_pseudo_legal_captures, generate_pseudo_legal_moves, MoveList};
 use crate::types::{Move, PieceType, Square};
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum MovePickerStage {
     TTMove,
+    GlobalPVMove,
     CapturesInit,
     GoodCaptures,
     Killers,
@@ -23,6 +24,7 @@ pub enum MovePickerStage {
 
 pub struct MovePicker {
     tt_move: Option<Move>,
+    global_pv: Option<Move>,
     counter_move: Option<Move>,
     ply: usize,
     stage: MovePickerStage,
@@ -36,6 +38,7 @@ pub struct MovePicker {
     bad_captures_count: usize,
     bad_quiets: [Move; 256],
     bad_quiets_count: usize,
+    thread_id: usize,
 }
 
 impl MovePicker {
@@ -45,6 +48,8 @@ impl MovePicker {
         counter_move: Option<Move>,
         quiescence: bool,
         in_check: bool,
+        thread_id: usize,
+        global_pv: Option<Move>,
     ) -> Self {
         let stage = if in_check {
             MovePickerStage::EvasionTT
@@ -53,6 +58,7 @@ impl MovePicker {
         };
         MovePicker {
             tt_move,
+            global_pv,
             counter_move,
             ply,
             stage,
@@ -64,6 +70,7 @@ impl MovePicker {
             bad_captures_count: 0,
             bad_quiets: [Move(0); 256],
             bad_quiets_count: 0,
+            thread_id,
         }
     }
 
@@ -71,16 +78,28 @@ impl MovePicker {
         loop {
             match self.stage {
                 MovePickerStage::TTMove => {
-                    self.stage = MovePickerStage::CapturesInit;
+                    self.stage = MovePickerStage::GlobalPVMove;
                     if let Some(m) = self.tt_move {
                         if board.is_pseudo_legal(m) {
                             return Some(m);
                         }
                     }
                 }
+                MovePickerStage::GlobalPVMove => {
+                    self.stage = MovePickerStage::CapturesInit;
+                    if let Some(m) = self.global_pv {
+                        if !self.is_tt_move(m) && board.is_pseudo_legal(m) {
+                            return Some(m);
+                        }
+                    }
+                }
                 MovePickerStage::CapturesInit => {
                     self.list.count = 0;
-                    generate_pseudo_legal_moves(board, &mut self.list);
+                    if self.quiescence {
+                        generate_pseudo_legal_captures(board, &mut self.list);
+                    } else {
+                        generate_pseudo_legal_moves(board, &mut self.list);
+                    }
                     self.score_captures(heuristics, board);
                     self.stage = MovePickerStage::GoodCaptures;
                     self.cur = 0;
@@ -90,7 +109,7 @@ impl MovePicker {
                         if !m.is_capture() && !m.is_promotion() {
                             continue;
                         }
-                        if self.is_tt_move(m) {
+                        if self.is_tt_move(m) || self.is_global_pv(m) {
                             continue;
                         }
 
@@ -115,6 +134,7 @@ impl MovePicker {
                         self.cur += 1;
                         if killer.0 != 0
                             && !self.is_tt_move(killer)
+                            && !self.is_global_pv(killer)
                             && board.is_pseudo_legal(killer)
                             && !killer.is_capture()
                         {
@@ -128,6 +148,7 @@ impl MovePicker {
                     self.stage = MovePickerStage::QuietsInit;
                     if let Some(cm) = self.counter_move {
                         if !self.is_tt_move(cm)
+                            && !self.is_global_pv(cm)
                             && !self.is_killer_move(heuristics, cm)
                             && board.is_pseudo_legal(cm)
                             && !cm.is_capture()
@@ -147,6 +168,7 @@ impl MovePicker {
                             continue;
                         }
                         if self.is_tt_move(m)
+                            || self.is_global_pv(m)
                             || self.is_killer_move(heuristics, m)
                             || self.is_counter_move(m)
                         {
@@ -199,7 +221,7 @@ impl MovePicker {
                 }
                 MovePickerStage::Evasions => {
                     if let Some(m) = self.get_next_scored_move() {
-                        if self.is_tt_move(m) {
+                        if self.is_tt_move(m) || self.is_global_pv(m) {
                             continue;
                         }
                         return Some(m);
@@ -252,7 +274,8 @@ impl MovePicker {
             None
         };
 
-        for i in 0..self.list.count {
+        // Optimization: Captures (0..self.cur) have already been yielded. Only iterate the remaining un-yielded moves.
+        for i in self.cur..self.list.count {
             let m = self.list.moves[i];
             if !m.is_capture() && !m.is_promotion() {
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
@@ -305,6 +328,10 @@ impl MovePicker {
                     }
                 }
 
+                if self.thread_id > 0 {
+                    h += h.wrapping_mul(self.thread_id as i32 + 3) % 256;
+                }
+
                 // Optimization: could add continuation history here if available
                 self.scores[i] = h;
             } else {
@@ -315,7 +342,7 @@ impl MovePicker {
 
     fn score_evasions(&mut self, heuristics: &Heuristics, board: &Board) {
         let side = board.side_to_move;
-        for i in 0..self.list.count {
+        for i in self.cur..self.list.count {
             let m = self.list.moves[i];
             if m.is_capture() {
                 let to_sq = m.to_sq();
@@ -372,6 +399,10 @@ impl MovePicker {
 
     fn is_tt_move(&self, m: Move) -> bool {
         self.tt_move.map(|ttm| ttm.0 == m.0).unwrap_or(false)
+    }
+
+    fn is_global_pv(&self, m: Move) -> bool {
+        self.global_pv.map(|pv| pv.0 == m.0).unwrap_or(false)
     }
 
     fn is_killer_move(&self, heuristics: &Heuristics, m: Move) -> bool {

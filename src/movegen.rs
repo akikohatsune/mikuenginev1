@@ -256,3 +256,133 @@ pub fn generate_pseudo_legal_moves(board: &Board, list: &mut MoveList) {
             }
     }
 }
+
+pub fn generate_pseudo_legal_captures(board: &Board, list: &mut MoveList) {
+    let side = board.side_to_move;
+    let us = board.color_occupancy(side);
+    let them = board.color_occupancy(side.flip());
+
+    // PAWNS
+    let pawns = board.color_piece_bb(side, PieceType::Pawn);
+    if side == Color::White {
+        // Promotions (some might be quiets, but usually all are considered tactical)
+        let pushes = (pawns << 8) & !(us | them);
+        let mut bb = pushes & Bitboard::new(crate::bitboard::RANK_8);
+        while bb.is_not_empty() {
+            let to = bb.pop_lsb();
+            let from = to - 8;
+            list.push(Move::new(from, to, Move::FLAG_PR_QUEEN));
+            list.push(Move::new(from, to, Move::FLAG_PR_ROOK));
+            list.push(Move::new(from, to, Move::FLAG_PR_BISHOP));
+            list.push(Move::new(from, to, Move::FLAG_PR_KNIGHT));
+        }
+
+        // Captures
+        let mut pawns_bb = pawns;
+        while pawns_bb.is_not_empty() {
+            let from = pawns_bb.pop_lsb();
+            let pawn_attacks = attacks::pawn_attacks(side, Square::new(from));
+            let mut att_bb = pawn_attacks & them;
+            while att_bb.is_not_empty() {
+                let to = att_bb.pop_lsb();
+                if to >= 56 {
+                    list.push(Move::new(from, to, Move::FLAG_PC_QUEEN));
+                    list.push(Move::new(from, to, Move::FLAG_PC_ROOK));
+                    list.push(Move::new(from, to, Move::FLAG_PC_BISHOP));
+                    list.push(Move::new(from, to, Move::FLAG_PC_KNIGHT));
+                } else {
+                    list.push(Move::new(from, to, Move::FLAG_CAPTURE));
+                }
+            }
+            if let Some(ep) = board.en_passant {
+                if (pawn_attacks & Bitboard::new(1u64 << ep.0)).is_not_empty() {
+                    list.push(Move::new(from, ep.0, Move::FLAG_EP));
+                }
+            }
+        }
+    } else {
+        // Black pawns
+        let pushes = (pawns >> 8) & !(us | them);
+        let mut bb = pushes & Bitboard::new(crate::bitboard::RANK_1);
+        while bb.is_not_empty() {
+            let to = bb.pop_lsb();
+            let from = to + 8;
+            list.push(Move::new(from, to, Move::FLAG_PR_QUEEN));
+            list.push(Move::new(from, to, Move::FLAG_PR_ROOK));
+            list.push(Move::new(from, to, Move::FLAG_PR_BISHOP));
+            list.push(Move::new(from, to, Move::FLAG_PR_KNIGHT));
+        }
+
+        let mut pawns_bb = pawns;
+        while pawns_bb.is_not_empty() {
+            let from = pawns_bb.pop_lsb();
+            let pawn_attacks = attacks::pawn_attacks(side, Square::new(from));
+            let mut att_bb = pawn_attacks & them;
+            while att_bb.is_not_empty() {
+                let to = att_bb.pop_lsb();
+                if to <= 7 {
+                    list.push(Move::new(from, to, Move::FLAG_PC_QUEEN));
+                    list.push(Move::new(from, to, Move::FLAG_PC_ROOK));
+                    list.push(Move::new(from, to, Move::FLAG_PC_BISHOP));
+                    list.push(Move::new(from, to, Move::FLAG_PC_KNIGHT));
+                } else {
+                    list.push(Move::new(from, to, Move::FLAG_CAPTURE));
+                }
+            }
+            if let Some(ep) = board.en_passant {
+                if (pawn_attacks & Bitboard::new(1u64 << ep.0)).is_not_empty() {
+                    list.push(Move::new(from, ep.0, Move::FLAG_EP));
+                }
+            }
+        }
+    }
+
+    // KNIGHTS
+    let mut knights = board.color_piece_bb(side, PieceType::Knight);
+    while knights.is_not_empty() {
+        let from = knights.pop_lsb();
+        let mut captures = attacks::knight_attacks(Square::new(from)) & them;
+        while captures.is_not_empty() {
+            list.push(Move::new(from, captures.pop_lsb(), Move::FLAG_CAPTURE));
+        }
+    }
+
+    // SLIDERS
+    let occ = us | them;
+    let mut bishops = board.color_piece_bb(side, PieceType::Bishop);
+    while bishops.is_not_empty() {
+        let from = bishops.pop_lsb();
+        let mut captures = attacks::bishop_attacks(Square::new(from), occ) & them;
+        while captures.is_not_empty() {
+            list.push(Move::new(from, captures.pop_lsb(), Move::FLAG_CAPTURE));
+        }
+    }
+
+    let mut rooks = board.color_piece_bb(side, PieceType::Rook);
+    while rooks.is_not_empty() {
+        let from = rooks.pop_lsb();
+        let mut captures = attacks::rook_attacks(Square::new(from), occ) & them;
+        while captures.is_not_empty() {
+            list.push(Move::new(from, captures.pop_lsb(), Move::FLAG_CAPTURE));
+        }
+    }
+
+    let mut queens = board.color_piece_bb(side, PieceType::Queen);
+    while queens.is_not_empty() {
+        let from = queens.pop_lsb();
+        let mut captures = attacks::queen_attacks(Square::new(from), occ) & them;
+        while captures.is_not_empty() {
+            list.push(Move::new(from, captures.pop_lsb(), Move::FLAG_CAPTURE));
+        }
+    }
+
+    // KING
+    let mut kings = board.color_piece_bb(side, PieceType::King);
+    if kings.is_not_empty() {
+        let k_sq = kings.pop_lsb();
+        let mut captures = attacks::king_attacks(Square::new(k_sq)) & them;
+        while captures.is_not_empty() {
+            list.push(Move::new(k_sq, captures.pop_lsb(), Move::FLAG_CAPTURE));
+        }
+    }
+}

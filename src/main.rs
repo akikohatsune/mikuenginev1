@@ -8,6 +8,8 @@ pub mod movepick;
 pub mod nnue;
 pub mod perft;
 pub mod search;
+pub mod smp;
+pub mod time;
 pub mod transposition;
 pub mod types;
 pub mod uci;

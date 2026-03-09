@@ -3,21 +3,23 @@ use crate::history::{Heuristics, MAX_PLY};
 use crate::movepick::MovePicker;
 use crate::transposition::{NodeType, TranspositionTable};
 use crate::types::{Move, PieceType, Square};
-use std::time::{Duration, Instant};
+use crate::time::TimeManager;
+use std::time::Instant;
 
 const INF: i32 = 50000;
 const MATE_SCORE: i32 = 48000;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crate::smp::SharedState;
 
 pub struct Search {
     pub tt: Arc<TranspositionTable>,
+    pub smp: Arc<SharedState>,
     pub heuristics: Heuristics,
     pub nodes: u64,
     pub start_time: Instant,
-    pub soft_limit: Duration,
-    pub hard_limit: Duration,
+    pub timer: TimeManager,
     pub stop: Arc<AtomicBool>,
     pub thread_id: usize,
     pub best_move: Move,
@@ -29,7 +31,7 @@ pub struct Search {
 }
 
 impl Search {
-    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>, thread_id: usize) -> Self {
+    pub fn new(smp: Arc<SharedState>, thread_id: usize) -> Self {
         let mut lmr_table = [[0; 64]; 64];
         for d in 1..64 {
             for m in 1..64 {
@@ -39,13 +41,13 @@ impl Search {
         }
 
         Search {
-            tt,
+            tt: smp.tt.clone(),
+            smp: smp.clone(),
             heuristics: Heuristics::new(),
             nodes: 0,
             start_time: Instant::now(),
-            soft_limit: Duration::from_secs(u64::MAX),
-            hard_limit: Duration::from_secs(u64::MAX),
-            stop,
+            timer: TimeManager::new(),
+            stop: smp.stop_flag.clone(),
             thread_id,
             best_move: Move::new(0, 0, 0),
             best_move_nodes: 0,
@@ -56,17 +58,12 @@ impl Search {
         }
     }
 
-    pub fn set_time(&mut self, time_ms: u64) {
-        // Soft limit = nominal time, Hard limit = 3x
-        self.soft_limit = Duration::from_millis(time_ms);
-        self.hard_limit = Duration::from_millis(time_ms.saturating_mul(3).min(u64::MAX / 2));
-    }
-
     pub fn check_time(&mut self) {
-        if self.nodes.is_multiple_of(2048)
-            && self.thread_id == 0 && self.start_time.elapsed() >= self.hard_limit {
+        if self.nodes.is_multiple_of(2048) {
+            if self.thread_id == 0 && self.timer.should_stop() {
                 self.stop.store(true, Ordering::Relaxed);
             }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -100,7 +97,7 @@ impl Search {
             alpha = stand_pat;
         }
 
-        let mut picker = MovePicker::new(None, 0, None, true, false);
+        let mut picker = MovePicker::new(None, 0, None, true, false, self.thread_id, None);
 
         while let Some(m) = picker.next(&self.heuristics, board) {
             let is_capture = (m.0 & 0x4000) != 0;
@@ -164,9 +161,9 @@ impl Search {
     }
 
     // ------------------------------------------------------------------
-    //   NEGAMAX WITH ALL MODERN HEURISTICS
+    //   FAIL-SOFT ALPHA-BETA WITH PVS
     // ------------------------------------------------------------------
-    pub fn negamax(
+    pub fn alpha_beta(
         &mut self,
         board: &mut Board,
         mut depth: u8,
@@ -233,7 +230,6 @@ impl Search {
         let mut tt_score = 0;
         let mut tt_depth = 0;
         let mut tt_node_type = NodeType::None;
-        let mut tt_is_pv = false;
 
         // TT Probe
         if let Some(entry) = self.tt.probe(board.zobrist_key) {
@@ -241,17 +237,18 @@ impl Search {
             tt_score = entry.score;
             tt_depth = entry.depth;
             tt_node_type = entry.node_type;
-            tt_is_pv = entry.is_pv;
 
-            if !pv_node && entry.depth >= depth {
+            if entry.depth >= depth {
                 if entry.node_type == NodeType::Exact {
-                    return entry.score;
+                    return entry.score; // PV nodes CAN be cut objectively if Exact
                 }
-                if entry.node_type == NodeType::Alpha && entry.score <= alpha {
-                    return alpha;
-                }
-                if entry.node_type == NodeType::Beta && entry.score >= beta {
-                    return beta;
+                if !pv_node {
+                    if entry.node_type == NodeType::Alpha && entry.score <= alpha {
+                        return alpha;
+                    }
+                    if entry.node_type == NodeType::Beta && entry.score >= beta {
+                        return beta;
+                    }
                 }
             }
 
@@ -308,19 +305,6 @@ impl Search {
             eval += correction_value;
         }
 
-        // Store static eval for improving detection
-        if ply < MAX_PLY {
-            self.heuristics.static_evals[ply] = eval;
-        }
-        let mut improving = !in_check && self.heuristics.is_improving(ply, eval);
-        improving |= eval >= beta; // #53: improving |= staticEval >= beta
-
-        let opponent_worsening = if ply >= 1 && !in_check {
-            eval > -self.heuristics.static_evals[ply - 1]
-        } else {
-            false
-        };
-
         let has_non_pawn_material = (board.colors[side as usize]
             & !(board.pieces[PieceType::Pawn as usize] | board.pieces[PieceType::King as usize]))
             .is_not_empty();
@@ -329,22 +313,18 @@ impl Search {
         //   PRE-MOVES PRUNING
         // ------------------------------------------------------------------
 
-        // Reverse Futility Pruning (Static Null Move Pruning)
-        // Use improving to adjust margin
+        // 1. Static Null Move Pruning (Reverse Futility Pruning)
         if !pv_node && !in_check && depth <= 6 {
-            let mut rfp_margin = depth as i32 * if improving { 75 } else { 120 };
-            if opponent_worsening {
-                rfp_margin -= depth as i32 * 25;
-            }
-            if eval - rfp_margin >= beta {
+            let margin = 100 + (depth as i32) * 50;
+            if eval - margin >= beta {
                 return eval;
             }
         }
 
-        // Razoring (Stockfish formula)
-        if !pv_node && !in_check && depth <= 4 {
-            let razor_margin = alpha - 485 - 281 * (depth as i32 * depth as i32);
-            if eval <= razor_margin {
+        // 5. Razoring
+        if !pv_node && !in_check && depth == 1 {
+            let margin = 200;
+            if eval + margin < alpha {
                 let q_score = self.quiescence(board, alpha, beta, 0);
                 if q_score <= alpha {
                     return q_score;
@@ -358,7 +338,7 @@ impl Search {
             let r = 3;
             let null_depth = depth.saturating_sub(r);
             let null_score =
-                -self.negamax(board, null_depth, -beta, -beta + 1, ply + 1, None, !pv_node);
+                -self.alpha_beta(board, null_depth, -beta, -beta + 1, ply + 1, None, !pv_node);
             board.unmake_null_move(&undo);
 
             if self.stop.load(Ordering::Relaxed) {
@@ -368,7 +348,7 @@ impl Search {
             if null_score >= beta {
                 if depth >= 8 && ply < depth as usize {
                     let verify_score =
-                        self.negamax(board, null_depth, alpha, beta, ply + 1, None, false);
+                        self.alpha_beta(board, null_depth, alpha, beta, ply + 1, None, false);
                     if verify_score >= beta {
                         return beta;
                     }
@@ -378,21 +358,10 @@ impl Search {
             }
         }
 
-        // Razoring
-        if !pv_node && !in_check && depth <= 2 {
-            let razor_margin = 300 + depth as i32 * 60;
-            if eval + razor_margin <= alpha {
-                let q = self.quiescence(board, alpha, beta, 0);
-                if q <= alpha {
-                    return q;
-                }
-            }
-        }
-
-        // Internal Iterative Deepening (IID)
+        // 4. Internal Iterative Deepening (IID)
         // If no TT move at high depth, do a reduced search to find one
-        if tt_move.is_none() && depth >= 4 && pv_node {
-            self.negamax(board, depth - 2, alpha, beta, ply, prev_move, cut_node);
+        if tt_move.is_none() && depth >= 6 && !in_check {
+            let _ = self.alpha_beta(board, depth - 2, alpha, beta, ply, prev_move, cut_node);
             if let Some(entry) = self.tt.probe(board.zobrist_key) {
                 tt_move = Some(entry.best_move);
             }
@@ -426,7 +395,13 @@ impl Search {
             None
         };
 
-        let mut picker = MovePicker::new(tt_move, ply, countermove, false, in_check);
+        let global_pv = if ply == 0 {
+            let pv_val = self.smp.get_best_move();
+            if pv_val != 0 { Some(Move(pv_val)) } else { None }
+        } else {
+            None
+        };
+        let mut picker = MovePicker::new(tt_move, ply, countermove, false, in_check, self.thread_id, global_pv);
 
         let mut legal_moves = 0;
         let mut best_m = Move::new(0, 0, 0);
@@ -522,7 +497,7 @@ impl Search {
                             let se_depth = (depth - 1) / 2;
 
                             board.unmake_move(m, &undo);
-                            let se_score = self.negamax(
+                            let se_score = self.alpha_beta(
                                 board,
                                 se_depth,
                                 se_beta - 1,
@@ -634,13 +609,18 @@ impl Search {
                     }
                 }
 
+                // --- SEE Pruning ---
+                // Prune bad captures at low depth, unless they check/promote or are in PV
+                if !pv_node && is_capture && !is_promo && !gives_check && depth <= 3 {
+                    if !board.see_ge(m, 0) {
+                        board.unmake_move(m, &undo);
+                        continue;
+                    }
+                }
+
                 // --- Late Move Pruning (LMP) ---
-                if !pv_node && depth <= 4 && !in_check && !is_capture && !is_promo && !gives_check {
-                    let lmp_threshold = if improving {
-                        3 + (depth as usize) * (depth as usize)
-                    } else {
-                        (3 + (depth as usize) * (depth as usize)) / 2
-                    };
+                if !pv_node && depth <= 3 && !in_check && !is_capture && !is_promo && !gives_check {
+                    let lmp_threshold = 3 + (depth as usize) * (depth as usize);
                     if legal_moves > lmp_threshold {
                         board.unmake_move(m, &undo);
                         continue;
@@ -648,7 +628,7 @@ impl Search {
                 }
 
                 // Compute search depth with extension
-                let mut new_depth = (depth as i32 - 1 + extension).max(0) as u8;
+                let new_depth = (depth as i32 - 1 + extension).max(0) as u8;
 
                 // --- Late Move Reductions (LMR) ---
                 let mut needs_full_search = true;
@@ -660,68 +640,29 @@ impl Search {
                     && !in_check
                     && !gives_check
                 {
-                    let d_idx = (depth as usize).min(63);
-                    let m_idx = legal_moves.min(63);
-                    // Fractional reduction (base 1024 = 1 depth)
-                    let mut r_frac = (self.lmr_table[d_idx][m_idx] as i32) * 1024;
+                    // Dynamic LMR Formula
+                    let mut r = (depth as i32 / 3) + (legal_moves as i32 / 5);
 
-                    // Reduce more when not improving
-                    if !improving {
-                        r_frac += 1024;
+                    // Apply smaller reduction in PV nodes
+                    if pv_node {
+                        r -= 1;
                     }
 
-                    // #19 cutNode LMR boost
-                    if cut_node {
-                        r_frac += 1024;
-                    }
-
-                    // #20 ttCapture LMR boost
-                    if let Some(ttm) = tt_move {
-                        if ttm.is_capture() {
-                            r_frac += 1024;
-                        }
-                    }
-
-                    // --- Stockfish Technique: cutoffCnt LMR boost ---
-                    // If we have searched many quiet moves without a cutoff, increase LMR
-                    if quiet_count > 2 {
-                        r_frac += 256 + 1024;
-                        // Add an extra boost if allNode (pv_node == false and no cutoffs yet)
-                        if !pv_node {
-                            r_frac += 1024;
-                        }
-                    }
-
-                    // ttPv LMR reduction reduction
-                    if tt_is_pv {
-                        r_frac -= 1024;
-                    }
-
-                    // Reduce less for killer/countermove
-                    let k = self.heuristics.killer_slot(m, ply);
-                    if k > 0 {
-                        r_frac -= 1024;
-                    }
-
-                    // Adjust by history score
+                    // Adjust by history score vaguely
                     let h = self
                         .heuristics
                         .get_history(side, attacker_pt, Square::new(m.to_sq()));
                     if h > 4000 {
-                        r_frac -= 1024;
-                    }
-                    if h < -2000 {
-                        r_frac += 1024;
+                        r -= 1;
+                    } else if h < -2000 {
+                        r += 1;
                     }
 
-                    // statScore LMR (smooth fractional offset)
-                    r_frac -= stat_score / 4;
-
-                    let r = (r_frac / 1024).max(0);
+                    r = r.max(0);
 
                     let reduced_depth = (new_depth as i32 - r).max(1) as u8;
 
-                    score = -self.negamax(
+                    score = -self.alpha_beta(
                         board,
                         reduced_depth,
                         -alpha - 1,
@@ -732,30 +673,25 @@ impl Search {
                     );
 
                     needs_full_search = score > alpha;
-
-                    // Hindsight depth adjustment
-                    if needs_full_search && r >= 3 && !opponent_worsening && new_depth < 60 {
-                        new_depth += 1;
-                    }
                 }
 
                 // --- Principal Variation Search (PVS) ---
                 if needs_full_search {
                     if legal_moves == 1 {
                         score =
-                            -self.negamax(board, new_depth, -beta, -alpha, ply + 1, Some(m), false);
+                            -self.alpha_beta(board, new_depth, -beta, -alpha, ply + 1, Some(m), false);
                     } else {
-                        score = -self.negamax(
+                        score = -self.alpha_beta(
                             board,
                             new_depth,
                             -alpha - 1,
                             -alpha,
                             ply + 1,
                             Some(m),
-                            !pv_node,
+                            true, // Zero-window searched nodes act as cut nodes
                         );
                         if score > alpha && score < beta {
-                            score = -self.negamax(
+                            score = -self.alpha_beta(
                                 board,
                                 new_depth,
                                 -beta,
@@ -964,6 +900,7 @@ impl Search {
                     best_m = m;
                     if ply == 0 {
                         self.best_move = m;
+                        self.smp.set_best_move(m);
                     }
 
                     // Update PV
@@ -1023,15 +960,17 @@ impl Search {
             }
         }
 
-        let node_type = if alpha > orig_alpha {
+        let node_type = if best_score >= beta {
+            NodeType::Beta
+        } else if best_score > orig_alpha {
             NodeType::Exact
         } else {
             NodeType::Alpha
         };
         self.tt
-            .store(board.zobrist_key, depth, alpha, node_type, best_m, pv_node);
+            .store(board.zobrist_key, depth, best_score, node_type, best_m, pv_node);
 
-        alpha
+        best_score
     }
 
     // ------------------------------------------------------------------
@@ -1044,15 +983,20 @@ impl Search {
         self.best_move = Move::new(0, 0, 0);
         self.best_move_nodes = 0;
         let mut average_score = 0;
-        let mut best_move_changes = 0;
 
-        for d in 1..=max_depth {
-            let prev_best_move = self.best_move;
+        let start_depth = if self.thread_id > 0 {
+            1 + (self.thread_id as u8 % 3)
+        } else {
+            1
+        };
+
+        for d in start_depth..=max_depth {
+            let nodes_before_iter = self.nodes;
             let score;
 
             // Aspiration Windows from depth 5+
             if d >= 5 {
-                let mut delta: i32 = 16;
+                let mut delta: i32 = 30;
                 let mut a = (average_score - delta).max(-INF);
                 let mut b = (average_score + delta).min(INF);
                 let mut failed_high_count = 0;
@@ -1065,7 +1009,7 @@ impl Search {
                     } else {
                         1
                     };
-                    let s = self.negamax(board, search_depth, a, b, 0, None, false);
+                    let s = self.alpha_beta(board, search_depth, a, b, 0, None, false);
 
                     if self.stop.load(Ordering::Relaxed) {
                         return self.best_move;
@@ -1073,15 +1017,28 @@ impl Search {
 
                     if s <= a {
                         // Fail low
-                        a = (a - delta).max(-INF);
-                        delta += delta / 2 + 5;
+                        if self.thread_id == 0 {
+                            self.timer.aspiration_fail(true);
+                        }
+                        delta = match delta {
+                            30 => 100,
+                            100 => 300,
+                            _ => INF,
+                        };
+                        a = (average_score - delta).max(-INF);
                         failed_high_count = 0;
                         search_again_counter += 1;
                     } else if s >= b {
                         // Fail high
-                        a = (a + s) / 2; // Tighter alpha
-                        b = (s + delta).min(INF);
-                        delta += delta / 2 + 5;
+                        if self.thread_id == 0 {
+                            self.timer.aspiration_fail(false);
+                        }
+                        delta = match delta {
+                            30 => 100,
+                            100 => 300,
+                            _ => INF,
+                        };
+                        b = (average_score + delta).min(INF);
                         failed_high_count += 1;
                         search_again_counter += 1;
                     } else {
@@ -1090,27 +1047,15 @@ impl Search {
                     }
 
                     if delta > 1000 {
-                        score = self.negamax(board, d, -INF, INF, 0, None, false);
+                        score = self.alpha_beta(board, d, -INF, INF, 0, None, false);
                         break;
                     }
                 }
             } else {
-                score = self.negamax(board, d, -INF, INF, 0, None, false);
+                score = self.alpha_beta(board, d, -INF, INF, 0, None, false);
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
-            }
-
-            // Panic time: if score drops significantly, extend
-            if d >= 6 && average_score - score > 50
-                && self.soft_limit != Duration::from_secs(u64::MAX) {
-                    let extra =
-                        Duration::from_millis((self.soft_limit.as_millis() as u64).min(2000));
-                    self.soft_limit += extra;
-                }
-
-            if d > 1 && self.best_move.0 != 0 && self.best_move.0 != prev_best_move.0 {
-                best_move_changes += 1;
             }
 
             if d == 1 {
@@ -1121,7 +1066,7 @@ impl Search {
 
             self.prev_best_score = score;
 
-            let elapsed = self.start_time.elapsed().as_millis();
+            let elapsed = self.timer.elapsed().max(1);
             let nps = if elapsed > 0 {
                 self.nodes as u128 * 1000 / elapsed
             } else {
@@ -1158,30 +1103,28 @@ impl Search {
                     score_str,
                     pv_str.trim()
                 );
-            }
 
-            // bestMoveInstability: scale soft limit
-            let mut effective_soft_limit = self.soft_limit;
-            if self.soft_limit != Duration::from_secs(u64::MAX) {
-                let instability_factor = 1.0 + 0.1 * (best_move_changes as f64).min(5.0);
-                effective_soft_limit = Duration::from_millis(
-                    (self.soft_limit.as_millis() as f64 * instability_factor) as u64,
-                );
+                // Update TimeManager
+                self.timer.update_pv(self.best_move.0);
+                self.timer.update_score(score);
 
-                // nodesEffort: if we spend too much time on a single move, reduce the limit to avoid wasting time
+                let nodes_this_iter = self.nodes - nodes_before_iter;
+                
+                // Move importance scaling (unclear best move)
                 if d > 5 {
                     let effort = self.best_move_nodes as f64 / (self.nodes.max(1) as f64);
-                    if effort > 0.7 {
-                        let scale = 1.6 - effort; // e.g., effort 0.9 -> limits time to 70%
-                        effective_soft_limit = Duration::from_millis(
-                            (effective_soft_limit.as_millis() as f64 * scale.max(0.5)) as u64,
-                        );
+                    if effort < 0.3 {
+                        self.timer.move_importance_high();
                     }
+                }
+
+                // Check if we can safely predict finishing the next iteration
+                if d < max_depth && !self.timer.can_start_next_iteration(nodes_this_iter, nps as u64) {
+                    self.stop.store(true, Ordering::Relaxed);
                 }
             }
 
-            // Soft time check: stop if we've used most of our time
-            if self.thread_id == 0 && self.start_time.elapsed() >= effective_soft_limit {
+            if self.stop.load(Ordering::Relaxed) {
                 break;
             }
         }

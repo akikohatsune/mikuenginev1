@@ -285,7 +285,10 @@ impl Board {
         let wk_sq = Square::new(wk_sq_opt);
         let bk_sq = Square::new(bk_sq_opt);
 
-        for sq in 0..64 {
+        // O(1) Bit-scan iteration over all occupied squares
+        let mut occ = self.occupancies();
+        while occ.is_not_empty() {
+            let sq = occ.pop_lsb();
             if let Some(piece) = self.piece_on_sq[sq as usize] {
                 if piece.piece_type() != PieceType::King {
                     white_features[w_count] =
