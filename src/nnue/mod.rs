@@ -9,7 +9,6 @@ pub mod accumulator;
 ///   incremental — delta-based incremental update helpers
 ///   simd        — AVX2 acceleration for linear layers
 pub mod feature;
-pub mod incremental;
 pub mod inference;
 
 /// Network parameters module (loader.rs contains NetworkParams)

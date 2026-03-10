@@ -161,8 +161,8 @@ pub fn feature_index_for_perspective(
     let oriented_ksq = if perspective == Color::White {
         orient_king_sq(ksq)
     } else {
-        // For black: flip the king square 180° first, then apply king mirror
-        orient_king_sq(Square::new(ksq.0 ^ 63))
+        // For black: flip the king square rank first, then apply king mirror
+        orient_king_sq(Square::new(ksq.0 ^ 56))
     };
     let bucket = KING_BUCKET_TABLE[oriented_ksq];
 
