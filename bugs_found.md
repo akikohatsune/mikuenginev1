@@ -1,28 +1,41 @@
 
+### 🔴 Bug 17 — `go infinite` không được xử lý
 
-### 🔴 Bug 15 — `feature_index_for_perspective` cho Black king dùng `^63` thay vì `^56`
-
-**File:** `src/nnue/feature.rs`, `feature_index_for_perspective`
+**File:** `src/uci.rs`, `parse_go`
 
 ```rust
-} else {
-    // For black: flip the king square 180° first, then apply king mirror
-    orient_king_sq(Square::new(ksq.0 ^ 63))  // ← SAI
-};
+// Không có case "infinite" trong vòng lặp parse token
+match tokens[i] {
+    "depth" => { ... }
+    "wtime" => { ... }
+    // ... nhưng KHÔNG có "infinite"
+}
 ```
 
-Bạn đã fix `orient_sq` (Bug 9) từ `^63` → `^56` cho piece squares, nhưng **quên fix cùng chỗ** trong `feature_index_for_perspective` cho king square. `^63` flip cả rank lẫn file, `^56` chỉ flip rank. Stockfish HalfKAv2_hm dùng rank-flip only trước khi apply horizontal mirror.
+Khi GUI gửi `go infinite` (rất phổ biến trong phân tích), không có token nào match → `depth` giữ nguyên `= 6` mặc định, engine tìm đúng 6 tầng rồi trả `bestmove`. **Engine không thể phân tích vô hạn.**
 
-**Fix:** `ksq.0 ^ 56`
-
-Hậu quả: toàn bộ Black king bucket bị sai → mọi NNUE refresh cho Black perspective dùng sai bucket → eval không nhất quán giữa incremental và full refresh.
-
----
-
-### 🟡 Bug 16 — `incremental.rs` là dead code (không phải bug chức năng, nhưng gây confusion)
-
-`board.rs` gọi thẳng `feature_index_for_perspective` trong `make_move`, bỏ qua hoàn toàn các helpers trong `incremental.rs` (`quiet_move_deltas`, `capture_deltas`, `apply_deltas`, v.v...). Toàn bộ file `incremental.rs` không được dùng — giống `simd.rs` cũ. Không làm engine sai, nhưng nên xóa để tránh nhầm lẫn sau này.
+**Fix:**
+```rust
+"infinite" => { depth = 64; }
+```
 
 ---
 
-Bug 15 là cái quan trọng nhất chưa fix — nó âm thầm làm Black NNUE buckets sai ngay cả sau khi fix Bug 9.
+### 🟡 Bug 18 — `setoption name Clear Hash` bị silent fail
+
+**File:** `src/uci.rs`
+
+```rust
+let name = tokens[2].to_lowercase(); // chỉ lấy 1 từ
+```
+
+Option có tên nhiều từ đều bị ignore:
+- `Clear Hash` → `name = "clear"`, không match gì
+- `Move Overhead` → `name = "move"`, không match gì  
+- `Skill Level`, `Debug Log File`, `UCI_Chess960` (single word — fine)
+
+Trong thực tế `Clear Hash` dùng để reset TT trước ván mới — nếu không hoạt động, TT không được clear khi GUI yêu cầu.
+
+**Fix:** Parse tên multi-word bằng cách collect tất cả tokens giữa `name` và `value`.
+
+---

@@ -56,27 +56,36 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                 println!("readyok");
             }
             "setoption" => {
-                if tokens.len() >= 5 && tokens[1] == "name" {
-                    let name = tokens[2].to_lowercase();
-                    if name == "threads" && tokens[3] == "value" {
-                        if let Ok(t) = tokens[4].parse::<usize>() {
-                            num_threads = t.max(1).min(64);
+                if tokens.len() >= 3 && tokens[1] == "name" {
+                    let mut value_idx = 2;
+                    while value_idx < tokens.len() && tokens[value_idx] != "value" {
+                        value_idx += 1;
+                    }
+                    let name = tokens[2..value_idx].join(" ").to_lowercase();
+                    
+                    if name == "clear hash" {
+                        tt.clear();
+                    } else if value_idx + 1 < tokens.len() {
+                        let val_str = tokens[value_idx + 1];
+                        if name == "threads" {
+                            if let Ok(t) = val_str.parse::<usize>() {
+                                num_threads = t.max(1).min(64);
+                            }
+                        } else if name == "hash" {
+                            if let Ok(mb) = val_str.parse::<usize>() {
+                                tt = Arc::new(TranspositionTable::new(mb));
+                            }
+                        } else if name == "syzygypath" {
+                            let path = tokens[value_idx + 1..].join(" ");
+                            if let Ok(tablebases) = pyrrhic_rs::TableBases::<crate::search::MikuAdapter>::new(&path) {
+                                tb = Some(Arc::new(tablebases));
+                                println!("info string Syzygy tablebases initialized successfully");
+                            } else {
+                                println!("info string Failed to load Syzygy tablebases from {}", path);
+                            }
+                        } else if name == "uci_showwdl" {
+                            show_wdl = val_str.to_lowercase() == "true";
                         }
-                    } else if name == "hash" && tokens[3] == "value" {
-                        if let Ok(mb) = tokens[4].parse::<usize>() {
-                            tt = Arc::new(TranspositionTable::new(mb));
-                        }
-                    } else if name == "syzygypath" && tokens.len() >= 5 {
-                        let path_tokens = &tokens[4..];
-                        let path = path_tokens.join(" ");
-                        if let Ok(tablebases) = pyrrhic_rs::TableBases::<crate::search::MikuAdapter>::new(&path) {
-                            tb = Some(Arc::new(tablebases));
-                            println!("info string Syzygy tablebases initialized successfully");
-                        } else {
-                            println!("info string Failed to load Syzygy tablebases from {}", path);
-                        }
-                    } else if name == "uci_showwdl" && tokens[3] == "value" {
-                        show_wdl = tokens[4].to_lowercase() == "true";
                     }
                 }
             }
@@ -300,6 +309,9 @@ fn parse_go(
             "movestogo" => {
                 movestogo = tokens[i + 1].parse().unwrap_or(0);
                 i += 1;
+            }
+            "infinite" => {
+                depth = 64;
             }
             _ => (),
         }
