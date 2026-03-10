@@ -4,17 +4,18 @@ pub const MAX_PLY: usize = 128;
 const HISTORY_MAX: i32 = 16384;
 
 pub struct Heuristics {
-    pub history: [[[i32; 64]; 6]; 2],  // [Color][PieceType][ToSquare]
+    pub history: [[[i32; 64]; 6]; 2],  // [Color][PieceType][ToSquare] — default 68
     pub killers: [[Move; 2]; MAX_PLY], // [Ply][Slot]
     pub countermoves: [[Move; 64]; 6], // [PrevPieceType][PrevToSq] -> Move
-    pub capture_history: [[[i32; 6]; 64]; 6], // [AttackerPT][ToSq][VictimPT]
-    pub cont_history: [[[[i32; 64]; 6]; 64]; 6], // [PrevPT][PrevTo][CurPT][CurTo]
+    pub capture_history: [[[i32; 6]; 64]; 6], // [AttackerPT][ToSq][VictimPT] — default -689
+    pub cont_history: [[[[i32; 64]; 6]; 64]; 6], // [PrevPT][PrevTo][CurPT][CurTo] — default -529
     pub pawn_history: [[[i32; 64]; 64]; 2], // [Color][FromSq][ToSq]
     pub minor_piece_history: [[[i32; 64]; 64]; 2], // [Color][FromSq][ToSq]
-    pub low_ply_history: [[i32; 4096]; 16], // [Ply][Move::raw()]
+    pub low_ply_history: [[i32; 4096]; 16], // [Ply][Move::raw()] — default 97
     pub static_evals: [i32; MAX_PLY],  // Static eval at each ply for improving
+    pub tt_move_history: i32,           // Like Stockfish ttMoveHistory
 
-    // New Stockfish Heuristics
+    // Correction Heuristics
     pub non_pawn_corr: [[i32; 16384]; 2], // [Color][MaterialHash % 16384]
     pub cont_corr: [[[[i32; 64]; 6]; 64]; 6], // [PrevPT][PrevTo][CurPT][CurTo]
 }
@@ -27,33 +28,45 @@ impl Default for Heuristics {
 
 impl Heuristics {
     pub fn new() -> Self {
-        Heuristics {
-            history: [[[0; 64]; 6]; 2],
+        // Match Stockfish defaults: mainHistory=68, captureHistory=-689, contHistory=-529, lowPly=97
+        let mut h = Heuristics {
+            history: [[[68; 64]; 6]; 2],
             killers: [[Move::new(0, 0, 0); 2]; MAX_PLY],
             countermoves: [[Move::new(0, 0, 0); 64]; 6],
-            capture_history: [[[0; 6]; 64]; 6],
-            cont_history: [[[[0; 64]; 6]; 64]; 6],
+            capture_history: [[[-689; 6]; 64]; 6],
+            cont_history: [[[[-529; 64]; 6]; 64]; 6],
             pawn_history: [[[0; 64]; 64]; 2],
             minor_piece_history: [[[0; 64]; 64]; 2],
-            low_ply_history: [[0; 4096]; 16],
+            low_ply_history: [[97; 4096]; 16],
             static_evals: [0; MAX_PLY],
+            tt_move_history: 0,
             non_pawn_corr: [[0; 16384]; 2],
-            cont_corr: [[[[0; 64]; 6]; 64]; 6],
-        }
+            cont_corr: [[[[8; 64]; 6]; 64]; 6], // Stockfish default 8
+        };
+        h
     }
 
     pub fn clear(&mut self) {
-        self.history = [[[0; 64]; 6]; 2];
+        // Decay mainHistory toward default (68) like Stockfish does each new search
+        for c in 0..2 {
+            for pt in 0..6 {
+                for sq in 0..64 {
+                    self.history[c][pt][sq] =
+                        (self.history[c][pt][sq] - 68) * 3 / 4 + 68;
+                }
+            }
+        }
         self.killers = [[Move::new(0, 0, 0); 2]; MAX_PLY];
         self.countermoves = [[Move::new(0, 0, 0); 64]; 6];
-        self.capture_history = [[[0; 6]; 64]; 6];
-        self.cont_history = [[[[0; 64]; 6]; 64]; 6];
+        self.capture_history = [[[-689; 6]; 64]; 6];
+        self.cont_history = [[[[-529; 64]; 6]; 64]; 6];
         self.pawn_history = [[[0; 64]; 64]; 2];
         self.minor_piece_history = [[[0; 64]; 64]; 2];
-        self.low_ply_history = [[0; 4096]; 16];
+        self.low_ply_history = [[97; 4096]; 16];
         self.static_evals = [0; MAX_PLY];
+        self.tt_move_history = 0;
         self.non_pawn_corr = [[0; 16384]; 2];
-        self.cont_corr = [[[[0; 64]; 6]; 64]; 6];
+        self.cont_corr = [[[[8; 64]; 6]; 64]; 6];
     }
 
     /// History Gravity update
@@ -124,6 +137,23 @@ impl Heuristics {
     }
 
     #[inline(always)]
+    pub fn penalize_continuation(
+        &mut self,
+        prev_pt: PieceType,
+        prev_to: Square,
+        cur_pt: PieceType,
+        cur_to: Square,
+        depth: u8,
+    ) {
+        let penalty = -((depth as i32) * (depth as i32));
+        Self::gravity_update(
+            &mut self.cont_history[prev_pt as usize][prev_to.0 as usize][cur_pt as usize]
+                [cur_to.0 as usize],
+            penalty,
+        );
+    }
+
+    #[inline(always)]
     pub fn get_continuation(
         &self,
         prev_pt: PieceType,
@@ -132,6 +162,12 @@ impl Heuristics {
         cur_to: Square,
     ) -> i32 {
         self.cont_history[prev_pt as usize][prev_to.0 as usize][cur_pt as usize][cur_to.0 as usize]
+    }
+
+    /// Gravity update on tt_move_history (like Stockfish's ttMoveHistory << value)
+    #[inline(always)]
+    pub fn update_tt_move_history(&mut self, bonus: i32) {
+        Self::gravity_update(&mut self.tt_move_history, bonus);
     }
 
     #[inline(always)]
