@@ -1,16 +1,15 @@
 /// NNUE Accumulator — maintains partially-evaluated network input per side.
 ///
-/// Two accumulators: one for White's perspective, one for Black's.
-/// Each is TRANSFORMED_SIZE (256) i16 values.
-///
-/// Stack-based push/pop for make_move / unmake_move.
+/// Upgraded to HalfKAv2_hm: 768-dim FT + 8-bucket PSQT accumulation.
 use super::feature::TRANSFORMED_SIZE;
-use super::network::NetworkParams;
+use super::network::{NetworkParams, PSQT_BUCKETS};
 
-/// Single-perspective accumulator
+/// Single-perspective accumulator (768 i16 values)
 #[derive(Clone)]
 pub struct SideAccumulator {
-    pub values: [i16; TRANSFORMED_SIZE],
+    pub values: Vec<i16>,
+    /// PSQT accumulation: one i32 per bucket
+    pub psqt: [i32; PSQT_BUCKETS],
 }
 
 impl Default for SideAccumulator {
@@ -20,9 +19,10 @@ impl Default for SideAccumulator {
 }
 
 impl SideAccumulator {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         SideAccumulator {
-            values: [0; TRANSFORMED_SIZE],
+            values: vec![0i16; TRANSFORMED_SIZE],
+            psqt: [0i32; PSQT_BUCKETS],
         }
     }
 }
@@ -41,7 +41,7 @@ impl Default for Accumulator {
 }
 
 impl Accumulator {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Accumulator {
             white: SideAccumulator::new(),
             black: SideAccumulator::new(),
@@ -51,12 +51,10 @@ impl Accumulator {
     /// Initialize from biases (full refresh)
     #[inline]
     pub fn init_from_bias(&mut self, params: &NetworkParams) {
-        self.white
-            .values
-            .copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
-        self.black
-            .values
-            .copy_from_slice(&params.ft_bias[..TRANSFORMED_SIZE]);
+        self.white.values.iter_mut().zip(params.ft_bias.iter()).for_each(|(a, &b)| *a = b);
+        self.black.values.iter_mut().zip(params.ft_bias.iter()).for_each(|(a, &b)| *a = b);
+        self.white.psqt = [0i32; PSQT_BUCKETS];
+        self.black.psqt = [0i32; PSQT_BUCKETS];
     }
 
     /// Full refresh: reset to bias, then add all active features
@@ -79,6 +77,11 @@ impl Accumulator {
                 self.white.values[i] +=
                     unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
             }
+            // PSQT accumulation
+            let psqt_offset = fi * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                self.white.psqt[b] += unsafe { *params.psqt_weight.get_unchecked(psqt_offset + b) };
+            }
         }
         for &fi in black_features {
             let offset = fi * TRANSFORMED_SIZE;
@@ -92,10 +95,14 @@ impl Accumulator {
                 self.black.values[i] +=
                     unsafe { *params.ft_weight.get_unchecked(offset + i) } as i16;
             }
+            let psqt_offset = fi * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                self.black.psqt[b] += unsafe { *params.psqt_weight.get_unchecked(psqt_offset + b) };
+            }
         }
     }
 
-    /// Add a feature to both perspectives
+    /// Add a feature — separate white and black indices (for incremental updates)
     #[inline(always)]
     pub fn add_feature(&mut self, white_idx: usize, black_idx: usize, params: &NetworkParams) {
         let w_offset = white_idx * TRANSFORMED_SIZE;
@@ -108,6 +115,15 @@ impl Accumulator {
                     *params.ft_weight.get_unchecked(w_offset + i) as i16;
                 *self.black.values.get_unchecked_mut(i) +=
                     *params.ft_weight.get_unchecked(b_offset + i) as i16;
+            }
+        }
+        // PSQT updates
+        let w_psqt = white_idx * PSQT_BUCKETS;
+        let b_psqt = black_idx * PSQT_BUCKETS;
+        for b in 0..PSQT_BUCKETS {
+            unsafe {
+                self.white.psqt[b] += *params.psqt_weight.get_unchecked(w_psqt + b);
+                self.black.psqt[b] += *params.psqt_weight.get_unchecked(b_psqt + b);
             }
         }
     }
@@ -125,6 +141,14 @@ impl Accumulator {
                     *params.ft_weight.get_unchecked(w_offset + i) as i16;
                 *self.black.values.get_unchecked_mut(i) -=
                     *params.ft_weight.get_unchecked(b_offset + i) as i16;
+            }
+        }
+        let w_psqt = white_idx * PSQT_BUCKETS;
+        let b_psqt = black_idx * PSQT_BUCKETS;
+        for b in 0..PSQT_BUCKETS {
+            unsafe {
+                self.white.psqt[b] -= *params.psqt_weight.get_unchecked(w_psqt + b);
+                self.black.psqt[b] -= *params.psqt_weight.get_unchecked(b_psqt + b);
             }
         }
     }

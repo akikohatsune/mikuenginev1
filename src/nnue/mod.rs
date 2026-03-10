@@ -1,11 +1,11 @@
 pub mod accumulator;
-/// NNUE Evaluation Module
+/// NNUE Evaluation Module — HalfKAv2_hm Architecture
 ///
 /// Sub-modules:
-///   feature     — HalfKP feature extraction
-///   accumulator — dual-perspective accumulator with push/pop
+///   feature     — HalfKAv2_hm feature extraction with 32 king buckets
+///   accumulator — dual-perspective accumulator with PSQT head
 ///   loader      — .nnue binary file parser (network module)
-///   inference   — forward pass with clipped ReLU
+///   inference   — forward pass with CReLU + SqrCReLU + PSQT
 ///   incremental — delta-based incremental update helpers
 ///   simd        — AVX2 acceleration for linear layers
 pub mod feature;
@@ -48,3 +48,4 @@ impl NNUE {
 // Re-exports for backward compatibility with existing board.rs code
 pub use accumulator::Accumulator;
 pub use feature::feature_index;
+pub use feature::feature_index_for_perspective;

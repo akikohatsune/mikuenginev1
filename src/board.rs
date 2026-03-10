@@ -5,7 +5,8 @@ use crate::types::{
 use crate::zobrist;
 
 use crate::attacks;
-use crate::nnue::{feature_index, Accumulator, NNUE};
+use crate::nnue::{feature_index_for_perspective, Accumulator, NNUE};
+
 use std::sync::Arc;
 
 pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -270,11 +271,6 @@ impl Board {
     }
 
     pub fn refresh_accumulator(&mut self) {
-        let mut white_features = [0; 32];
-        let mut black_features = [0; 32];
-        let mut w_count = 0;
-        let mut b_count = 0;
-
         let wk_sq_opt = self.color_piece_bb(Color::White, PieceType::King).lsb();
         let bk_sq_opt = self.color_piece_bb(Color::Black, PieceType::King).lsb();
 
@@ -285,28 +281,37 @@ impl Board {
         let wk_sq = Square::new(wk_sq_opt);
         let bk_sq = Square::new(bk_sq_opt);
 
+        // Collect features for both perspectives (HalfKAv2_hm includes all pieces, including kings)
+        let mut white_features = Vec::with_capacity(32);
+        let mut black_features = Vec::with_capacity(32);
+
         // O(1) Bit-scan iteration over all occupied squares
         let mut occ = self.occupancies();
         while occ.is_not_empty() {
             let sq = occ.pop_lsb();
             if let Some(piece) = self.piece_on_sq[sq as usize] {
-                if piece.piece_type() != PieceType::King {
-                    white_features[w_count] =
-                        feature_index(wk_sq, Square::new(sq), piece.piece_type(), piece.color());
-                    black_features[b_count] =
-                        feature_index(bk_sq, Square::new(sq), piece.piece_type(), piece.color());
-                    w_count += 1;
-                    b_count += 1;
-                }
+                let pt = piece.piece_type();
+                let pc = piece.color();
+                let piece_sq = Square::new(sq);
+
+                // White perspective: king on wk_sq
+                white_features.push(feature_index_for_perspective(
+                    Color::White, wk_sq, piece_sq, pt, pc,
+                ));
+                // Black perspective: king on bk_sq
+                black_features.push(feature_index_for_perspective(
+                    Color::Black, bk_sq, piece_sq, pt, pc,
+                ));
             }
         }
 
         self.accumulator.refresh(
-            &white_features[..w_count],
-            &black_features[..b_count],
+            &white_features,
+            &black_features,
             &self.nnue.params,
         );
     }
+
 
     pub fn compute_hash(&self) -> u64 {
         let mut h = 0;
@@ -462,13 +467,13 @@ impl Board {
 
         // Move piece incrementally in NNUE (if it's not a king)
         if pt != PieceType::King {
-            let rm_w = feature_index(wk_sq, from, pt, color);
-            let rm_b = feature_index(bk_sq, from, pt, color);
+            let rm_w = feature_index_for_perspective(Color::White, wk_sq, from, pt, color);
+            let rm_b = feature_index_for_perspective(Color::Black, bk_sq, from, pt, color);
             self.accumulator
                 .remove_feature(rm_w, rm_b, &self.nnue.params);
 
-            let add_w = feature_index(wk_sq, to, pt, color);
-            let add_b = feature_index(bk_sq, to, pt, color);
+            let add_w = feature_index_for_perspective(Color::White, wk_sq, to, pt, color);
+            let add_b = feature_index_for_perspective(Color::Black, bk_sq, to, pt, color);
             self.accumulator
                 .add_feature(add_w, add_b, &self.nnue.params);
         }
@@ -477,8 +482,8 @@ impl Board {
 
         if let Some(c_pt) = captured_piece {
             if c_pt != PieceType::King {
-                let rmc_w = feature_index(wk_sq, to, c_pt, color.flip());
-                let rmc_b = feature_index(bk_sq, to, c_pt, color.flip());
+                let rmc_w = feature_index_for_perspective(Color::White, wk_sq, to, c_pt, color.flip());
+                let rmc_b = feature_index_for_perspective(Color::Black, bk_sq, to, c_pt, color.flip());
                 self.accumulator
                     .remove_feature(rmc_w, rmc_b, &self.nnue.params);
             }
@@ -496,9 +501,9 @@ impl Board {
                 Square::new(to.0 + 8)
             };
 
-            // Remove captured ET pawn from NNUE
-            let rme_w = feature_index(wk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
-            let rme_b = feature_index(bk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
+            // Remove captured ep pawn from NNUE
+            let rme_w = feature_index_for_perspective(Color::White, wk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
+            let rme_b = feature_index_for_perspective(Color::Black, bk_sq, ep_cap_sq, PieceType::Pawn, color.flip());
             self.accumulator
                 .remove_feature(rme_w, rme_b, &self.nnue.params);
 
@@ -533,13 +538,13 @@ impl Board {
             };
 
             // NNUE incremental update for castled rook
-            let rmr_w = feature_index(wk_sq, rook_from, PieceType::Rook, color);
-            let rmr_b = feature_index(bk_sq, rook_from, PieceType::Rook, color);
+            let rmr_w = feature_index_for_perspective(Color::White, wk_sq, rook_from, PieceType::Rook, color);
+            let rmr_b = feature_index_for_perspective(Color::Black, bk_sq, rook_from, PieceType::Rook, color);
             self.accumulator
                 .remove_feature(rmr_w, rmr_b, &self.nnue.params);
 
-            let addr_w = feature_index(wk_sq, rook_to, PieceType::Rook, color);
-            let addr_b = feature_index(bk_sq, rook_to, PieceType::Rook, color);
+            let addr_w = feature_index_for_perspective(Color::White, wk_sq, rook_to, PieceType::Rook, color);
+            let addr_b = feature_index_for_perspective(Color::Black, bk_sq, rook_to, PieceType::Rook, color);
             self.accumulator
                 .add_feature(addr_w, addr_b, &self.nnue.params);
 
@@ -552,13 +557,13 @@ impl Board {
             let promo_pt = m.promotion_type();
 
             // Fix NNUE promotion override: Replace the inserted pawn with the promoted piece
-            let rmp_w = feature_index(wk_sq, to, PieceType::Pawn, color);
-            let rmp_b = feature_index(bk_sq, to, PieceType::Pawn, color);
+            let rmp_w = feature_index_for_perspective(Color::White, wk_sq, to, PieceType::Pawn, color);
+            let rmp_b = feature_index_for_perspective(Color::Black, bk_sq, to, PieceType::Pawn, color);
             self.accumulator
                 .remove_feature(rmp_w, rmp_b, &self.nnue.params);
 
-            let addp_w = feature_index(wk_sq, to, promo_pt, color);
-            let addp_b = feature_index(bk_sq, to, promo_pt, color);
+            let addp_w = feature_index_for_perspective(Color::White, wk_sq, to, promo_pt, color);
+            let addp_b = feature_index_for_perspective(Color::Black, bk_sq, to, promo_pt, color);
             self.accumulator
                 .add_feature(addp_w, addp_b, &self.nnue.params);
 

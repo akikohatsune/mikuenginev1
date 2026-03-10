@@ -1,30 +1,45 @@
 use std::fs::File;
 /// NNUE Network Parameters and Binary Loader
 ///
-/// Parses Stockfish-compatible .nnue files in little-endian format.
-/// Network architecture: HalfKP → FT(256) → L1(32) → L2(32) → Output(1)
+/// HalfKAv2_hm architecture (Stockfish-compatible):
+///   FT: HALFKA_FEATURES(22528) × TRANSFORMED_SIZE(768) — i8 weights, i16 biases
+///   PSQT: HALFKA_FEATURES × PSQT_BUCKETS — i32 weights (8 buckets)
+///   L1: (2 × TRANSFORMED_SIZE × 2) → L1_SIZE (SqrCReLU doubles input dim)
+///   L2: L1_SIZE → L2_SIZE
+///   Output: L2_SIZE → 1 scalar
 use std::io::{self, BufReader, Read};
 
 use super::feature::{HALFKP_FEATURES, TRANSFORMED_SIZE};
 
-/// Hidden layer sizes
-pub const L1_SIZE: usize = 32;
-pub const L2_SIZE: usize = 32;
+/// Hidden layer sizes (same as Stockfish's Big network)
+pub const L1_SIZE: usize = 16;  // FC_0_OUTPUTS
+pub const L2_SIZE: usize = 32;  // FC_1_OUTPUTS
+
+/// PSQT buckets (8, like Stockfish)
+pub const PSQT_BUCKETS: usize = 8;
+
+/// L1 input size: SqrCReLU doubles FT output (2*TRANSFORMED_SIZE) × 2 = 4*TRANSFORMED_SIZE
+/// But we concatenate both sides (stm + nstm): 2 * TRANSFORMED_SIZE each side.
+/// After SqrCReLU: each half produces L1_SIZE_HALF = 2 * TRANSFORMED_SIZE outputs.
+/// Here we use the flat concatenated size: 2 * TRANSFORMED_SIZE * 2 sides
+pub const L1_INPUT_SIZE: usize = 2 * TRANSFORMED_SIZE * 2;  // = 3072
 
 /// Network parameters — all stored as aligned arrays
 pub struct NetworkParams {
-    // Feature Transformer: HALFKP_FEATURES * TRANSFORMED_SIZE weights (i8)
+    // Feature Transformer: HALFKA_FEATURES × TRANSFORMED_SIZE weights (i8)
     pub ft_weight: Vec<i8>,
     // Feature Transformer bias: TRANSFORMED_SIZE values (i16)
-    pub ft_bias: [i16; TRANSFORMED_SIZE],
+    pub ft_bias: Vec<i16>,
 
-    // Layer 1: (2 * TRANSFORMED_SIZE) → L1_SIZE
-    // Input is concatenation of [white_acc, black_acc] = 512 values
-    pub l1_weight: [[i8; 512]; L1_SIZE],
+    // PSQT weights: HALFKA_FEATURES × PSQT_BUCKETS (i32)
+    pub psqt_weight: Vec<i32>,
+
+    // Layer 1: L1_INPUT_SIZE → L1_SIZE
+    pub l1_weight: Vec<[i8; L1_INPUT_SIZE]>,
     pub l1_bias: [i32; L1_SIZE],
 
-    // Layer 2: L1_SIZE → L2_SIZE
-    pub l2_weight: [[i8; L1_SIZE]; L2_SIZE],
+    // Layer 2: L1_SIZE × 2 → L2_SIZE (×2 for SqrCReLU concatenation)
+    pub l2_weight: Vec<[i8; L1_SIZE * 2]>,
     pub l2_bias: [i32; L2_SIZE],
 
     // Output: L2_SIZE → 1
@@ -43,10 +58,11 @@ impl NetworkParams {
         let ft_weight_size = HALFKP_FEATURES * TRANSFORMED_SIZE;
         NetworkParams {
             ft_weight: vec![0i8; ft_weight_size],
-            ft_bias: [0i16; TRANSFORMED_SIZE],
-            l1_weight: [[0i8; 512]; L1_SIZE],
+            ft_bias: vec![0i16; TRANSFORMED_SIZE],
+            psqt_weight: vec![0i32; HALFKP_FEATURES * PSQT_BUCKETS],
+            l1_weight: vec![[0i8; L1_INPUT_SIZE]; L1_SIZE],
             l1_bias: [0i32; L1_SIZE],
-            l2_weight: [[0i8; L1_SIZE]; L2_SIZE],
+            l2_weight: vec![[0i8; L1_SIZE * 2]; L2_SIZE],
             l2_bias: [0i32; L2_SIZE],
             out_weight: [0i8; L2_SIZE],
             out_bias: 0,
@@ -60,21 +76,16 @@ impl NetworkParams {
         let mut params = Self::new();
 
         // --- Header ---
-        // Magic: 4 bytes (version), Description: skip variable length
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
 
-        // Read description length + description (null-terminated string marker)
-        // Stockfish NNUE format: after magic, there's a hash, then architecture description
         let mut hash = [0u8; 4];
         reader.read_exact(&mut hash)?;
 
-        // Architecture description size (4 bytes LE)
         let mut desc_size_buf = [0u8; 4];
         reader.read_exact(&mut desc_size_buf)?;
         let desc_size = u32::from_le_bytes(desc_size_buf) as usize;
 
-        // Skip description
         let mut desc = vec![0u8; desc_size];
         reader.read_exact(&mut desc)?;
 
@@ -82,14 +93,27 @@ impl NetworkParams {
         let mut ft_hash = [0u8; 4];
         reader.read_exact(&mut ft_hash)?;
 
-        // FT Biases: TRANSFORMED_SIZE * 2 bytes (i16 LE)
-        let mut bias_buf = [0u8; TRANSFORMED_SIZE * 2];
+        // PSQT Weights: HALFKA_FEATURES × PSQT_BUCKETS i32 values
+        let psqt_count = HALFKP_FEATURES * PSQT_BUCKETS;
+        let mut psqt_buf = vec![0u8; psqt_count * 4];
+        reader.read_exact(&mut psqt_buf)?;
+        for i in 0..psqt_count {
+            params.psqt_weight[i] = i32::from_le_bytes([
+                psqt_buf[i * 4],
+                psqt_buf[i * 4 + 1],
+                psqt_buf[i * 4 + 2],
+                psqt_buf[i * 4 + 3],
+            ]);
+        }
+
+        // FT Biases: TRANSFORMED_SIZE × 2 bytes (i16 LE)
+        let mut bias_buf = vec![0u8; TRANSFORMED_SIZE * 2];
         reader.read_exact(&mut bias_buf)?;
         for i in 0..TRANSFORMED_SIZE {
             params.ft_bias[i] = i16::from_le_bytes([bias_buf[i * 2], bias_buf[i * 2 + 1]]);
         }
 
-        // FT Weights: HALFKP_FEATURES * TRANSFORMED_SIZE bytes (i8)
+        // FT Weights: HALFKA_FEATURES × TRANSFORMED_SIZE bytes (i8)
         let ft_weight_count = HALFKP_FEATURES * TRANSFORMED_SIZE;
         let mut weight_buf = vec![0u8; ft_weight_count];
         reader.read_exact(&mut weight_buf)?;
@@ -101,34 +125,34 @@ impl NetworkParams {
         let mut net_hash = [0u8; 4];
         reader.read_exact(&mut net_hash)?;
 
-        // Layer 1 biases: L1_SIZE * 4 bytes (i32 LE)
+        // Layer 1 biases: L1_SIZE × 4 bytes (i32 LE)
         for j in 0..L1_SIZE {
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf)?;
             params.l1_bias[j] = i32::from_le_bytes(buf);
         }
 
-        // Layer 1 weights: L1_SIZE * 512 bytes (i8), stored row-major
+        // Layer 1 weights: L1_SIZE × L1_INPUT_SIZE bytes (i8), stored row-major
         for j in 0..L1_SIZE {
-            let mut row = [0u8; 512];
+            let mut row = vec![0u8; L1_INPUT_SIZE];
             reader.read_exact(&mut row)?;
-            for k in 0..512 {
+            for k in 0..L1_INPUT_SIZE {
                 params.l1_weight[j][k] = row[k] as i8;
             }
         }
 
-        // Layer 2 biases: L2_SIZE * 4 bytes (i32 LE)
+        // Layer 2 biases: L2_SIZE × 4 bytes (i32 LE)
         for j in 0..L2_SIZE {
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf)?;
             params.l2_bias[j] = i32::from_le_bytes(buf);
         }
 
-        // Layer 2 weights: L2_SIZE * L1_SIZE bytes (i8)
+        // Layer 2 weights: L2_SIZE × (L1_SIZE*2) bytes (i8)
         for j in 0..L2_SIZE {
-            let mut row = [0u8; L1_SIZE];
+            let mut row = vec![0u8; L1_SIZE * 2];
             reader.read_exact(&mut row)?;
-            for k in 0..L1_SIZE {
+            for k in 0..(L1_SIZE * 2) {
                 params.l2_weight[j][k] = row[k] as i8;
             }
         }

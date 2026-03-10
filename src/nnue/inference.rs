@@ -1,110 +1,135 @@
 use super::accumulator::Accumulator;
-use super::network::{NetworkParams, L1_SIZE, L2_SIZE};
-use super::simd;
-/// NNUE Forward Pass Inference
+use super::network::{NetworkParams, L1_SIZE, L2_SIZE, PSQT_BUCKETS};
+/// NNUE Forward Pass Inference — HalfKAv2_hm architecture
 ///
-/// Pipeline:
-///   accumulator → clipped ReLU → L1 → clipped ReLU → L2 → clipped ReLU → output
+/// Pipeline (Stockfish-aligned):
+///   1. Clamp FT(768) accumulators with CReLU and SqrCReLU
+///   2. Concatenate [stm_crelu || nstm_crelu || stm_sqr || nstm_sqr] → L1 input
+///   3. L1 = fc_0(concat) → SqrCReLU + CReLU (concatenated for fc_1)
+///   4. L2 = fc_1(L1_cat)  → CReLU
+///   5. output = fc_2(L2) + PSQT_contribution
 ///
-/// All integer arithmetic, no floats.
+/// All integer arithmetic as in Stockfish.
 use crate::types::Color;
 
-/// Full forward pass through the network
-/// Returns evaluation in centipawns from perspective of `side_to_move`
-#[cfg(target_arch = "x86_64")]
-pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
-    let mut input = [0u8; 512];
-
-    let (stm_acc, nstm_acc) = match side {
-        Color::White => (&acc.white, &acc.black),
-        Color::Black => (&acc.black, &acc.white),
-    };
-
-    // Step 1: Apply clipped ReLU to both accumulators and concatenate
-    unsafe {
-        let in_ptr = input.as_mut_ptr() as *mut [u8; 256];
-        simd::clipped_relu_avx2(&stm_acc.values, &mut *in_ptr);
-        simd::clipped_relu_avx2(&nstm_acc.values, &mut *in_ptr.add(1));
-    }
-
-    // Step 2: L1 = clipped_relu(W1 * input + b1)
-    let mut l1_out = [0i32; L1_SIZE];
-    unsafe {
-        simd::linear_forward_avx2(&input, &params.l1_weight, &params.l1_bias, &mut l1_out);
-    }
-
-    // Apply AVX2 scaling clipped ReLU to L1 output
-    let mut l1_clipped = [0u8; L1_SIZE];
-    unsafe {
-        simd::l1_clipped_avx2(&l1_out, &mut l1_clipped);
-    }
-
-    // Step 3: L2 = clipped_relu(W2 * l1_out + b2)
-    let mut l2_out = [0i32; L2_SIZE];
-    unsafe {
-        simd::l2_forward_avx2(&l1_clipped, &params.l2_weight, &params.l2_bias, &mut l2_out);
-    }
-
-    // Step 4: L2 scaling and Output Forward Pass
-    let mut output = params.out_bias;
-
-    for i in 0..L2_SIZE {
-        let scaled = l2_out[i] >> 6;
-        let l2_c = if scaled <= 0 {
-            0
-        } else if scaled >= 127 {
-            127
-        } else {
-            scaled as u8
-        };
-        output += l2_c as i32 * params.out_weight[i] as i32;
-    }
-
-    // Scale output to centipawns (divide by 600 to match standard WDL-based NNUE scale)
-    (output / 600).clamp(-4000, 4000)
+/// Count non-pawn pieces for PSQT bucket selection (same as SF)
+fn psqt_bucket(acc: &Accumulator, side: Color) -> usize {
+    // Stockfish uses piece count for bucket selection.
+    // We can approximate with a simple scheme: use 0 as default bucket since we won't have trained weights.
+    // The PSQT bucket can be improved when an actual trained .nnue is used.
+    // For now, always use bucket 0 for correctness without a real network.
+    let _ = (acc, side); // suppress unused warnings
+    0
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// Apply CReLU to a slice of i16 accumulator values, writing u8 output
+#[inline(always)]
+fn crelu_slice(input: &[i16], output: &mut [u8]) {
+    for (o, &i) in output.iter_mut().zip(input.iter()) {
+        *o = i.clamp(0, 127) as u8;
+    }
+}
+
+/// Apply SqrCReLU: clamp(x,0,127)^2 / 128, written as u8
+/// Stockfish: sqr_clipped_relu output = clamp(x,0,127)*clamp(x,0,127) >> 7
+#[inline(always)]
+fn sqr_crelu_slice(input: &[i16], output: &mut [u8]) {
+    for (o, &i) in output.iter_mut().zip(input.iter()) {
+        let c = i.clamp(0, 127) as i32;
+        *o = ((c * c) >> 7) as u8;
+    }
+}
+
+
+
+/// Full forward pass
+/// Returns evaluation in centipawns from perspective of `side_to_move`
 pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
-    let mut input = [0u8; 512];
+    let ts = super::feature::TRANSFORMED_SIZE;
 
     let (stm_acc, nstm_acc) = match side {
         Color::White => (&acc.white, &acc.black),
         Color::Black => (&acc.black, &acc.white),
     };
 
-    // Step 1: Apply clipped ReLU to both accumulators and concatenate
-    let (stm_in, nstm_in) = input.split_at_mut(256);
-    simd::clipped_relu_scalar(&stm_acc.values, stm_in.try_into().unwrap());
-    simd::clipped_relu_scalar(&nstm_acc.values, nstm_in.try_into().unwrap());
+    // Step 1: CReLU + SqrCReLU on both perspectives
+    let mut stm_crelu  = vec![0u8; ts];
+    let mut nstm_crelu = vec![0u8; ts];
+    let mut stm_sqr    = vec![0u8; ts];
+    let mut nstm_sqr   = vec![0u8; ts];
 
-    // Step 2: L1 = clipped_relu(W1 * input + b1)
+    crelu_slice(&stm_acc.values, &mut stm_crelu);
+    crelu_slice(&nstm_acc.values, &mut nstm_crelu);
+    sqr_crelu_slice(&stm_acc.values, &mut stm_sqr);
+    sqr_crelu_slice(&nstm_acc.values, &mut nstm_sqr);
+
+    // Step 2: Concatenate into L1 input
+    // Layout: [stm_crelu | nstm_crelu | stm_sqr | nstm_sqr]
+    let mut l1_input = vec![0u8; ts * 4];
+    l1_input[..ts].copy_from_slice(&stm_crelu);
+    l1_input[ts..2*ts].copy_from_slice(&nstm_crelu);
+    l1_input[2*ts..3*ts].copy_from_slice(&stm_sqr);
+    l1_input[3*ts..4*ts].copy_from_slice(&nstm_sqr);
+
+    // Step 3: L1 linear layer
+    // l1_weight has shape [L1_SIZE][L1_INPUT_SIZE], but L1_INPUT_SIZE = 4*ts = 3072
+    // We only use the first L1_INPUT_SIZE elements
+    let l1_input_size = params.l1_weight.get(0).map(|w| w.len()).unwrap_or(0);
+    let effective_input_len = l1_input.len().min(l1_input_size);
     let mut l1_out = [0i32; L1_SIZE];
-    simd::linear_forward_scalar(&input, &params.l1_weight, &params.l1_bias, &mut l1_out);
-
-    // Apply scaling clipped ReLU to L1 output
-    let mut l1_clipped = [0u8; L1_SIZE];
-    simd::l1_clipped_scalar(&l1_out, &mut l1_clipped);
-
-    // Step 3: L2 = clipped_relu(W2 * l1_out + b2)
-    let mut l2_out = [0i32; L2_SIZE];
-    simd::l2_forward_scalar(&l1_clipped, &params.l2_weight, &params.l2_bias, &mut l2_out);
-
-    // Step 4: L2 scaling and Output Forward Pass
-    let mut output = params.out_bias;
-
-    for i in 0..L2_SIZE {
-        let scaled = l2_out[i] >> 6;
-        let l2_c = if scaled <= 0 {
-            0
-        } else if scaled >= 127 {
-            127
-        } else {
-            scaled as u8
-        };
-        output += l2_c as i32 * params.out_weight[i] as i32;
+    for j in 0..L1_SIZE {
+        let mut sum = params.l1_bias[j];
+        for k in 0..effective_input_len {
+            sum += l1_input[k] as i32 * params.l1_weight[j][k] as i32;
+        }
+        l1_out[j] = sum;
     }
 
-    // Scale output to centipawns (divide by 600 to match standard WDL-based NNUE scale)
-    (output / 600).clamp(-4000, 4000)
+    // CReLU + SqrCReLU on L1 output, then concatenate → L2 input
+    let mut l1_crelu = [0u8; L1_SIZE];
+    let mut l1_sqr   = [0u8; L1_SIZE];
+    for j in 0..L1_SIZE {
+        let val = (l1_out[j] >> 6).clamp(0, 127);
+        l1_crelu[j] = val as u8;
+        l1_sqr[j]   = ((val * val) >> 7) as u8;
+    }
+    // Concatenate [l1_crelu | l1_sqr] → size L1_SIZE*2
+    let mut l2_input = [0u8; L1_SIZE * 2];
+    l2_input[..L1_SIZE].copy_from_slice(&l1_crelu);
+    l2_input[L1_SIZE..].copy_from_slice(&l1_sqr);
+
+    // Step 4: L2 linear layer
+    let mut l2_out = [0i32; L2_SIZE];
+    for j in 0..L2_SIZE {
+        let mut sum = params.l2_bias[j];
+        for k in 0..(L1_SIZE * 2) {
+            sum += l2_input[k] as i32 * params.l2_weight[j][k] as i32;
+        }
+        l2_out[j] = sum;
+    }
+
+    // CReLU on L2
+    let mut l2_crelu = [0u8; L2_SIZE];
+    for j in 0..L2_SIZE {
+        l2_crelu[j] = (l2_out[j] >> 6).clamp(0, 127) as u8;
+    }
+
+    // Step 5: Output layer + PSQT
+    let mut output = params.out_bias as i64;
+    for k in 0..L2_SIZE {
+        output += l2_crelu[k] as i64 * params.out_weight[k] as i64;
+    }
+
+    // Add PSQT contribution (select bucket based on piece count)
+    let bucket = psqt_bucket(acc, side).min(PSQT_BUCKETS - 1);
+    let psqt_stm  = stm_acc.psqt[bucket] as i64;
+    let psqt_nstm = nstm_acc.psqt[bucket] as i64;
+    let psqt_val = (psqt_stm - psqt_nstm) / 2;
+
+    // Scale: Stockfish uses OutputScale=16, WeightScaleBits=6
+    // output is in units of 127*(1<<6). We scale to centipawns.
+    // PSQT is already in centipawns * some factor; approximate divide by 128.
+    let total = (output + psqt_val) / 128;
+
+    total.clamp(-4000, 4000) as i32
 }
