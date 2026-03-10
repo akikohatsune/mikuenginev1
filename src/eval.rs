@@ -117,17 +117,34 @@ pub fn endgame_evaluate(board: &Board, raw_eval: i32) -> i32 {
     
     // Pawn endgames (King and Pawns only)
     if w_non_pawn == 0 && b_non_pawn == 0 {
-        // Very simplified Pawn Race check to help NNUE:
-        // If we have passed pawns that can promote before the enemy king catches them, boost eval
-        let our_pawns = board.color_piece_bb(side, PieceType::Pawn);
+        let mut our_pawns = board.color_piece_bb(side, PieceType::Pawn);
         let enemy_king = Square::new((board.color_piece_bb(side.flip(), PieceType::King)).lsb());
         
-        // This is a rough estimation of the square rule.
-        // A full passed pawn detection requires more logic, 
-        // but NNUE usually handles normal positions, we just want to flag obvious unstoppable ones.
-        if raw_eval > 0 {
-            // Give a boost to positions NNUE already thinks are good, to convert them faster
-            return raw_eval + 200;
+        let mut passed_bonus = 0;
+        while our_pawns.is_not_empty() {
+            let sq = Square::new(our_pawns.lsb());
+            our_pawns.clear_bit(sq.0);
+            
+            let prom_y = if side == Color::White { 7 } else { 0 };
+            let dist_to_prom = (sq.rank() as i32 - prom_y as i32).abs();
+            let king_dist = (enemy_king.rank() as i32 - prom_y as i32).abs().max((enemy_king.file() as i32 - sq.file() as i32).abs());
+            
+            let pawn_dist = if (side == Color::White && sq.rank() == 1) || (side == Color::Black && sq.rank() == 6) {
+                dist_to_prom - 2
+            } else {
+                dist_to_prom.max(1) - 1
+            };
+            
+            if pawn_dist < king_dist {
+                passed_bonus += 800;
+            }
+        }
+        
+        let new_eval = raw_eval + passed_bonus;
+        if passed_bonus > 0 {
+            return new_eval + 200;
+        } else if new_eval > 0 {
+            return new_eval + 100;
         }
     }
 

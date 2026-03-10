@@ -11,7 +11,6 @@ pub mod accumulator;
 pub mod feature;
 pub mod incremental;
 pub mod inference;
-pub mod simd;
 
 /// Network parameters module (loader.rs contains NetworkParams)
 pub mod network {
@@ -40,8 +39,8 @@ impl NNUE {
     }
 
     /// Evaluate the current position from the perspective of `side`
-    pub fn evaluate(&self, side: Color, acc: &accumulator::Accumulator) -> i32 {
-        inference::evaluate(side, acc, &self.params)
+    pub fn evaluate(&self, side: Color, acc: &accumulator::Accumulator, piece_count: u32) -> i32 {
+        inference::evaluate(side, acc, &self.params, piece_count)
     }
 }
 

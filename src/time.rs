@@ -99,6 +99,10 @@ impl TimeManager {
         self.start_time.elapsed().as_millis()
     }
 
+    pub fn reset_to_base(&mut self) {
+        self.opt_time = self.base_opt_time;
+    }
+
     // Iterative Deepening Integration (Stop checks)
     pub fn should_stop(&self) -> bool {
         self.elapsed() >= self.max_time

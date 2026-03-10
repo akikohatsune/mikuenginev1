@@ -13,13 +13,8 @@ use super::network::{NetworkParams, L1_SIZE, L2_SIZE, PSQT_BUCKETS};
 use crate::types::Color;
 
 /// Count non-pawn pieces for PSQT bucket selection (same as SF)
-fn psqt_bucket(acc: &Accumulator, side: Color) -> usize {
-    // Stockfish uses piece count for bucket selection.
-    // We can approximate with a simple scheme: use 0 as default bucket since we won't have trained weights.
-    // The PSQT bucket can be improved when an actual trained .nnue is used.
-    // For now, always use bucket 0 for correctness without a real network.
-    let _ = (acc, side); // suppress unused warnings
-    0
+fn psqt_bucket(piece_count: u32) -> usize {
+    ((piece_count.saturating_sub(1)) / 4).min(PSQT_BUCKETS as u32 - 1) as usize
 }
 
 /// Apply CReLU to a slice of i16 accumulator values, writing u8 output
@@ -44,8 +39,8 @@ fn sqr_crelu_slice(input: &[i16], output: &mut [u8]) {
 
 /// Full forward pass
 /// Returns evaluation in centipawns from perspective of `side_to_move`
-pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
-    let ts = super::feature::TRANSFORMED_SIZE;
+pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams, piece_count: u32) -> i32 {
+    let ts = super::feature::TRANSFORMED_SIZE; // 768
 
     let (stm_acc, nstm_acc) = match side {
         Color::White => (&acc.white, &acc.black),
@@ -53,10 +48,10 @@ pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
     };
 
     // Step 1: CReLU + SqrCReLU on both perspectives
-    let mut stm_crelu  = vec![0u8; ts];
-    let mut nstm_crelu = vec![0u8; ts];
-    let mut stm_sqr    = vec![0u8; ts];
-    let mut nstm_sqr   = vec![0u8; ts];
+    let mut stm_crelu  = [0u8; 768];
+    let mut nstm_crelu = [0u8; 768];
+    let mut stm_sqr    = [0u8; 768];
+    let mut nstm_sqr   = [0u8; 768];
 
     crelu_slice(&stm_acc.values, &mut stm_crelu);
     crelu_slice(&nstm_acc.values, &mut nstm_crelu);
@@ -65,11 +60,11 @@ pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
 
     // Step 2: Concatenate into L1 input
     // Layout: [stm_crelu | nstm_crelu | stm_sqr | nstm_sqr]
-    let mut l1_input = vec![0u8; ts * 4];
-    l1_input[..ts].copy_from_slice(&stm_crelu);
-    l1_input[ts..2*ts].copy_from_slice(&nstm_crelu);
-    l1_input[2*ts..3*ts].copy_from_slice(&stm_sqr);
-    l1_input[3*ts..4*ts].copy_from_slice(&nstm_sqr);
+    let mut l1_input = [0u8; 768 * 4];
+    l1_input[..768].copy_from_slice(&stm_crelu);
+    l1_input[768..2*768].copy_from_slice(&nstm_crelu);
+    l1_input[2*768..3*768].copy_from_slice(&stm_sqr);
+    l1_input[3*768..4*768].copy_from_slice(&nstm_sqr);
 
     // Step 3: L1 linear layer
     // l1_weight has shape [L1_SIZE][L1_INPUT_SIZE], but L1_INPUT_SIZE = 4*ts = 3072
@@ -121,7 +116,7 @@ pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
     }
 
     // Add PSQT contribution (select bucket based on piece count)
-    let bucket = psqt_bucket(acc, side).min(PSQT_BUCKETS - 1);
+    let bucket = psqt_bucket(piece_count);
     let psqt_stm  = stm_acc.psqt[bucket] as i64;
     let psqt_nstm = nstm_acc.psqt[bucket] as i64;
     let psqt_val = (psqt_stm - psqt_nstm) / 2;

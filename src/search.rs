@@ -62,6 +62,28 @@ impl pyrrhic_rs::EngineAdapter for MikuAdapter {
     }
 }
 
+#[inline(always)]
+pub fn score_to_tt(score: i32, ply: usize) -> i32 {
+    if score > MATE_SCORE - 100 {
+        score + ply as i32
+    } else if score < -MATE_SCORE + 100 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+#[inline(always)]
+pub fn score_from_tt(score: i32, ply: usize) -> i32 {
+    if score > MATE_SCORE - 100 {
+        score - ply as i32
+    } else if score < -MATE_SCORE + 100 {
+        score + ply as i32
+    } else {
+        score
+    }
+}
+
 pub struct Search {
     pub tt: Arc<TranspositionTable>,
     pub smp: Arc<SharedState>,
@@ -169,51 +191,125 @@ impl Search {
         beta: i32,
     ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
+            return crate::eval::endgame_evaluate(
+                board,
+                board.nnue.evaluate(board.side_to_move, &board.accumulator, board.occupancies().count() as u32),
+            );
         }
+
         self.nodes += 1;
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
             return 0;
         }
 
-        let stand_pat = crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
-        if stand_pat >= beta {
-            return beta;
-        }
-        if stand_pat > alpha {
-            alpha = stand_pat;
+        // 1. In check detection
+        let side = board.side_to_move;
+        let king_sq_opt = board.piece_bb(PieceType::King) & board.color_occupancy(side);
+        let in_check = if king_sq_opt.is_not_empty() {
+            let king_sq = Square::new(king_sq_opt.lsb());
+            board.is_square_attacked(king_sq, side.flip())
+        } else {
+            false
+        };
+
+        // 2. Transposition Table Probe
+        let mut tt_move: Option<Move> = None;
+        let mut tt_score = 0i32;
+        let mut tt_node_type = crate::transposition::NodeType::None;
+        let mut tt_hit = false;
+
+        if let Some(entry) = self.tt.probe(board.zobrist_key) {
+            tt_move = Some(entry.best_move);
+            tt_score = score_from_tt(entry.score, ply);
+            tt_node_type = entry.node_type;
+            tt_hit = true;
         }
 
-        let mut picker = MovePicker::new(None, 0, None, true, false, self.thread_id, None);
+        // TT cutoff in Q-Search
+        if tt_hit {
+            match tt_node_type {
+                crate::transposition::NodeType::Exact => return tt_score,
+                crate::transposition::NodeType::Alpha if tt_score <= alpha => return alpha,
+                crate::transposition::NodeType::Beta if tt_score >= beta => return beta,
+                _ => {}
+            }
+        }
+
+        // 3. Stand Pat (Static Eval)
+        let mut best_score = -crate::search::INF; // INF = 30000
+        let mut futility_base = -crate::search::INF;
+
+        if !in_check {
+            let stand_pat = crate::eval::endgame_evaluate(
+                board,
+                board.nnue.evaluate(board.side_to_move, &board.accumulator, board.occupancies().count() as u32),
+            );
+            best_score = stand_pat;
+            
+            if stand_pat >= beta {
+                if !tt_hit {
+                    self.tt.store(
+                        board.zobrist_key,
+                        0,
+                        score_to_tt(stand_pat, ply),
+                        crate::transposition::NodeType::Beta,
+                        Move::none(),
+                        false,
+                    );
+                }
+                return stand_pat;
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
+            
+            futility_base = stand_pat + 351; // Stockfish QS Futility Margin
+        }
+
+        let mut best_m = Move::none();
+        
+        // Evasions are generated implicitly if we are in check because MovePicker
+        // generates evasions rather than captures if `in_check` is true.
+        let mut picker = MovePicker::new(tt_move, ply, None, true, in_check, self.thread_id, None);
+        let mut move_count = 0;
 
         while let Some(m) = picker.next(&self.heuristics, board) {
-            let is_capture = (m.0 & 0x4000) != 0;
-            let is_promo = (m.0 >> 12 & 0x3) != 0;
+            move_count += 1;
+            let is_capture = m.is_capture();
+            let is_promo = m.is_promotion();
 
-            if !is_capture && !is_promo {
-                continue;
-            }
-
-            // Delta Pruning
-            if is_capture && !is_promo {
-                let to_sq = m.to_sq();
-                let margin = 200;
-
-                if let Some(victim) = board.piece_on_sq[to_sq as usize] {
-                    let victim_val = crate::eval::PIECE_VALUES[victim.piece_type() as usize];
-                    if stand_pat + victim_val + margin < alpha {
+            if !in_check {
+                // In quiescence, we only want captures or promotions
+                if !is_capture && !is_promo {
+                    continue;
+                }
+                
+                // Futility pruning
+                // If the move does not give check and isn't a promotion, we see if capturing
+                // the piece is still well below alpha.
+                if move_count > 2 && !is_promo && futility_base > -crate::search::MATE_SCORE + 100 {
+                    let to_sq = m.to_sq();
+                    let victim_val = if let Some(victim) = board.piece_on_sq[to_sq as usize] {
+                        crate::eval::PIECE_VALUES[victim.piece_type() as usize]
+                    } else if m.is_en_passant() {
+                        crate::eval::PAWN_VALUE
+                    } else {
+                        0
+                    };
+                    
+                    if futility_base + victim_val <= alpha {
+                        best_score = best_score.max(futility_base + victim_val);
                         continue;
                     }
-                } else if (m.0 & 0x8000) != 0
-                    && stand_pat + crate::eval::PAWN_VALUE + margin < alpha {
-                        continue;
-                    }
-            }
+                }
 
-            // SEE Pruning
-            if is_capture && !board.see_ge(m, 0) {
-                continue;
+                // SEE Pruning
+                // Stockfish uses different margins for SEE based on move count in QS.
+                let margin = if is_promo { 0 } else { 0 }; // Simplified SEE
+                if !board.see_ge(m, margin) {
+                    continue;
+                }
             }
 
             if !board.is_castling_legal(m) {
@@ -222,30 +318,59 @@ impl Search {
 
             let undo = board.make_move(m);
 
-            let side = board.side_to_move.flip();
-            let king_sq_opt = board.piece_bb(PieceType::King) & board.color_occupancy(side);
-            let in_check = if king_sq_opt.is_not_empty() {
-                let king_sq = Square::new(king_sq_opt.lsb());
-                board.is_square_attacked(king_sq, board.side_to_move)
+            let move_side = board.side_to_move.flip();
+            let mk = board.piece_bb(PieceType::King) & board.color_occupancy(move_side);
+            let gives_illegal_check = if mk.is_not_empty() {
+                board.is_square_attacked(Square::new(mk.lsb()), board.side_to_move)
             } else {
                 false
             };
 
-            if !in_check {
-                let score = -self.quiescence(board, ss, ply + 1, -beta, -alpha);
+            if gives_illegal_check {
                 board.unmake_move(m, &undo);
-                if score >= beta {
-                    return beta;
-                }
+                continue;
+            }
+
+            let score = -self.quiescence(board, ss, ply + 1, -beta, -alpha);
+            board.unmake_move(m, &undo);
+            
+            if score > best_score {
+                best_score = score;
+                best_m = m;
+                
                 if score > alpha {
                     alpha = score;
+                    if score >= beta {
+                        self.tt.store(
+                            board.zobrist_key,
+                            0, // depth 0 for QS
+                            score_to_tt(score, ply),
+                            crate::transposition::NodeType::Beta,
+                            m,
+                            false,
+                        );
+                        return score;
+                    }
                 }
-            } else {
-                board.unmake_move(m, &undo);
             }
         }
+        
+        // If we are in check and have no legal moves, it's checkmate.
+        // If we are evaluating QS, MATE_SCORE must be adjusted by ply distance!
+        if in_check && best_score == -crate::search::INF {
+            return -crate::search::MATE_SCORE + ply as i32;
+        }
+        
+        // Write Exact or Alpha bound to TT
+        let node_type = if best_score > alpha {
+            crate::transposition::NodeType::Exact
+        } else {
+            crate::transposition::NodeType::Alpha
+        };
+        
+        self.tt.store(board.zobrist_key, 0, score_to_tt(best_score, ply), node_type, best_m, false);
 
-        alpha
+        best_score
     }
 
     // ------------------------------------------------------------------
@@ -263,16 +388,19 @@ impl Search {
         cut_node: bool,
     ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
+            return crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator, board.occupancies().count() as u32));
         }
 
-        let true_hash = board.compute_hash();
-        if board.zobrist_key != true_hash {
-            eprintln!(
-                "HASH DRIFT IN NEGAMAX! inc={:x}, true={:x}, ply={}",
-                board.zobrist_key, true_hash, ply
-            );
-            std::process::exit(1);
+        #[cfg(debug_assertions)]
+        {
+            let true_hash = board.compute_hash();
+            if board.zobrist_key != true_hash {
+                eprintln!(
+                    "HASH DRIFT IN NEGAMAX! inc={:x}, true={:x}, ply={}",
+                    board.zobrist_key, true_hash, ply
+                );
+                std::process::exit(1);
+            }
         }
 
         self.nodes += 1;
@@ -329,15 +457,15 @@ impl Search {
                         };
 
                         let tb_bound = if tb_value > draw_score {
-                            NodeType::Exact // Win
+                            NodeType::Beta // Win => lower bound
                         } else if tb_value < draw_score {
-                            NodeType::Exact // Loss
+                            NodeType::Alpha // Loss => upper bound
                         } else {
                             NodeType::Exact // Draw
                         };
 
                         if tb_bound == NodeType::Exact || (tb_bound == NodeType::Beta && tb_value >= beta) || (tb_bound == NodeType::Alpha && tb_value <= alpha) {
-                            self.tt.store(board.zobrist_key, 0, tb_value, tb_bound, Move::none(), pv_node);
+                            self.tt.store(board.zobrist_key, 0, score_to_tt(tb_value, ply), tb_bound, Move::none(), pv_node);
                             return tb_value;
                         }
                     }
@@ -364,7 +492,7 @@ impl Search {
         if excluded_move.is_none() {
             if let Some(entry) = self.tt.probe(board.zobrist_key) {
                 tt_move = Some(entry.best_move);
-                tt_score = entry.score;
+                tt_score = score_from_tt(entry.score, ply);
                 tt_depth = entry.depth;
                 tt_node_type = entry.node_type;
                 tt_hit = true;
@@ -414,7 +542,7 @@ impl Search {
             ss[ply].static_eval = SearchStack::NONE_EVAL;
             -INF
         } else if tt_hit {
-            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator));
+            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator, board.occupancies().count() as u32));
             let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
             ss[ply].static_eval = corrected;
             // Use tt_score as better eval if bound agrees
@@ -423,7 +551,7 @@ impl Search {
                 tt_score
             } else { corrected }
         } else {
-            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator));
+            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator, board.occupancies().count() as u32));
             let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
             ss[ply].static_eval = corrected;
             corrected
@@ -554,7 +682,7 @@ impl Search {
                         board.unmake_move(pc_move, &pc_undo);
 
                         if pc_val >= prob_cut_beta {
-                            self.tt.store(board.zobrist_key, depth.saturating_sub(4), pc_val,
+                            self.tt.store(board.zobrist_key, depth.saturating_sub(4), score_to_tt(pc_val, ply),
                                 NodeType::Beta, pc_move, pv_node);
                             if pc_val < MATE_SCORE - 100 {
                                 return pc_val - (prob_cut_beta - beta);
@@ -621,6 +749,12 @@ impl Search {
                 .map(|p| p.piece_type())
                 .unwrap_or(PieceType::Pawn);
 
+            let stat_victim = if is_capture {
+                if m.flag() == Move::FLAG_EP { PieceType::Pawn }
+                else { board.piece_on_sq[m.to_sq() as usize]
+                    .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn) }
+            } else { PieceType::Pawn };
+
             // --- Pre-make-move pruning (Stockfish Step 14) ---
             if !root_node && has_non_pawn && best_score > -MATE_SCORE + 100 {
                 // LMP
@@ -634,14 +768,11 @@ impl Search {
 
                 if is_capture || (is_promo && !is_capture) {
                     // Capture futility pruning (Stockfish formula)
-                    let victim_pt = if m.flag() == Move::FLAG_EP { PieceType::Pawn }
-                        else { board.piece_on_sq[m.to_sq() as usize]
-                            .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn) };
                     let capt_hist = self.heuristics.get_capture_history(
-                        attacker_pt, Square::new(m.to_sq()), victim_pt);
+                        attacker_pt, Square::new(m.to_sq()), stat_victim);
                     if lmr_depth < 7 {
                         let fv = eval + 232 + 217 * lmr_depth
-                            + crate::eval::PIECE_VALUES[victim_pt as usize]
+                            + crate::eval::PIECE_VALUES[stat_victim as usize]
                             + 131 * capt_hist / 1024;
                         if fv <= alpha { continue; }
                     }
@@ -676,9 +807,13 @@ impl Search {
             if !board.is_castling_legal(m) { continue; }
 
             let undo = board.make_move(m);
-            if board.zobrist_key != board.compute_hash() {
-                eprintln!("HASH DRIFT AFTER MAKE_MOVE! ply={}", ply);
-                std::process::exit(1);
+            
+            #[cfg(debug_assertions)]
+            {
+                if board.zobrist_key != board.compute_hash() {
+                    eprintln!("HASH DRIFT AFTER MAKE_MOVE! ply={}", ply);
+                    std::process::exit(1);
+                }
             }
 
             let move_side = board.side_to_move.flip();
@@ -768,10 +903,8 @@ impl Search {
 
             // Stat score for LMR
             let stat_score = if is_capture {
-                let victim_pt = board.piece_on_sq[m.to_sq() as usize]
-                    .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);
-                868 * crate::eval::PIECE_VALUES[victim_pt as usize] / 128
-                    + self.heuristics.get_capture_history(attacker_pt, Square::new(m.to_sq()), victim_pt)
+                868 * crate::eval::PIECE_VALUES[stat_victim as usize] / 128
+                    + self.heuristics.get_capture_history(attacker_pt, Square::new(m.to_sq()), stat_victim)
             } else {
                 let mut ss_val = 2 * self.heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
                 if let Some(pm) = prev_move {
@@ -876,9 +1009,13 @@ impl Search {
             first_move = false;
 
             board.unmake_move(m, &undo);
-            if board.zobrist_key != board.compute_hash() {
-                eprintln!("HASH DRIFT AFTER UNMAKE! ply={}", ply);
-                std::process::exit(1);
+            
+            #[cfg(debug_assertions)]
+            {
+                if board.zobrist_key != board.compute_hash() {
+                    eprintln!("HASH DRIFT AFTER UNMAKE! ply={}", ply);
+                    std::process::exit(1);
+                }
             }
 
             if self.stop.load(Ordering::Relaxed) { return 0; }
@@ -893,6 +1030,26 @@ impl Search {
                 if !is_capture {
                     let see_ok = board.see_ge(m, 0);
                     if see_ok {
+                        // Bug 14 Fix: Update correction history on quiet fail-highs
+                        if ss[ply].static_eval != SearchStack::NONE_EVAL 
+                            && ss[ply].static_eval.abs() < MATE_SCORE - 100 
+                            && score.abs() < MATE_SCORE - 100 
+                        {
+                            let diff = score - ss[ply].static_eval;
+                            let weight = (cur_depth as i32).min(16) * 16;
+                            let mat_hash = board.non_pawn_material(side) as usize;
+                            self.heuristics.update_non_pawn_correction(side, mat_hash, diff, weight);
+                            
+                            if let Some(pm) = prev_move {
+                                if let Some(pp) = board.piece_on_sq[pm.to_sq() as usize] {
+                                    self.heuristics.update_cont_correction(
+                                        pp.piece_type(), Square::new(pm.to_sq()), 
+                                        attacker_pt, Square::new(m.to_sq()), 
+                                        diff, weight);
+                                }
+                            }
+                        }
+
                         self.heuristics.update_history(side, attacker_pt, Square::new(m.to_sq()), cur_depth);
                         if attacker_pt == PieceType::Pawn {
                             self.heuristics.update_pawn_history(side, Square::new(m.from_sq()), Square::new(m.to_sq()), cur_depth);
@@ -938,7 +1095,7 @@ impl Search {
                     (best_score * cur_depth as i32 + beta) / (cur_depth as i32 + 1)
                 } else { best_score };
 
-                self.tt.store(board.zobrist_key, cur_depth, ret_score, NodeType::Beta, m, pv_node);
+                self.tt.store(board.zobrist_key, cur_depth, score_to_tt(ret_score, ply), NodeType::Beta, m, pv_node);
                 // ttMoveHistory update (Stockfish)
                 self.heuristics.update_tt_move_history(if Some(m) == tt_move { 809 } else { -865 });
                 return ret_score;
@@ -1004,7 +1161,7 @@ impl Search {
             NodeType::Alpha
         };
         self.tt
-            .store(board.zobrist_key, depth, best_score, node_type, best_m, pv_node);
+            .store(board.zobrist_key, depth, score_to_tt(best_score, ply), node_type, best_m, pv_node);
 
         best_score
     }
@@ -1093,6 +1250,11 @@ impl Search {
         for d in start_depth..=max_depth {
             let nodes_before_iter = self.nodes;
             let score;
+            
+            // Bug 6 Fix: Reset best_move_nodes for each depth independently
+            self.best_move_nodes = 0;
+            // Bug 7 Fix: Reset scaled opt_time padding back to base per search depth
+            self.timer.reset_to_base();
 
             // Reset ss for each iteration
             for s in ss.iter_mut() { *s = SearchStack::new(); }

@@ -274,8 +274,9 @@ impl MovePicker {
             None
         };
 
-        // Optimization: Captures (0..self.cur) have already been yielded. Only iterate the remaining un-yielded moves.
-        for i in self.cur..self.list.count {
+        // Bug 4 Fix: Captures might have bumped `self.cur`, but we still need to score ALL quiet moves 
+        // in the list, no matter if they are early in the list.
+        for i in 0..self.list.count {
             let m = self.list.moves[i];
             if !m.is_capture() && !m.is_promotion() {
                 let attacker_pt = match board.piece_on_sq[m.from_sq() as usize] {
@@ -329,7 +330,8 @@ impl MovePicker {
                 }
 
                 if self.thread_id > 0 {
-                    h += h.wrapping_mul(self.thread_id as i32 + 3) % 256;
+                    // Bug 5 Fix: Use a clean additive uniform noise to flip branch choices
+                    h += (self.thread_id as i32 * 7 + 13) % 64;
                 }
 
                 // Optimization: could add continuation history here if available

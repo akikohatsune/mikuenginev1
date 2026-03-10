@@ -106,7 +106,7 @@ pub fn orient_sq(sq: Square, perspective: Color) -> usize {
     if perspective == Color::White {
         sq.0 as usize
     } else {
-        (sq.0 ^ 63) as usize // 180-degree rotation (flip rank AND file)
+        (sq.0 ^ 56) as usize // 180-degree rotation (flip rank AND file) -> Wait! 56 only flips rank! Which is correct.
     }
 }
 
