@@ -417,4 +417,25 @@ let corrected = (raw + correction_value / 131072).clamp(...);
 
 `non_pawn_corr` được init bằng 0 và không bao giờ thay đổi. Toàn bộ correction machinery — được thiết kế để học sai lệch giữa static eval và search score — là dead code hoàn toàn.
 
----
+
+### ⚠️ Còn 1 chỗ chưa fix — `update_capture_history` sau `make_move`
+
+**`search.rs` line ~1089** — khi best move là capture, lúc update history:
+
+```rust
+} else {
+    let victim_pt = board.piece_on_sq[m.to_sq() as usize]  // ← AFTER make_move!
+        .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);  // luôn = Pawn
+    self.heuristics.update_capture_history(attacker_pt, Square::new(m.to_sq()), victim_pt, cur_depth);
+}
+```
+
+Bạn đã fix `stat_victim` cho stat_score block, nhưng cái này — dùng để **update capture history sau fail-high** — vẫn đọc sau `make_move`. Fix tương tự: dùng `stat_victim` đã lưu sẵn:
+
+```rust
+} else {
+    self.heuristics.update_capture_history(attacker_pt, Square::new(m.to_sq()), stat_victim, cur_depth);
+}
+```
+
+Ngoài ra code sạch, logic đúng hết. Fix nốt cái này là xong.

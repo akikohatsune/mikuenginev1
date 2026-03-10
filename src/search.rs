@@ -1085,9 +1085,7 @@ impl Search {
                         self.heuristics.penalize_low_ply_history(qm, ply, cur_depth);
                     }
                 } else {
-                    let victim_pt = board.piece_on_sq[m.to_sq() as usize]
-                        .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);
-                    self.heuristics.update_capture_history(attacker_pt, Square::new(m.to_sq()), victim_pt, cur_depth);
+                    self.heuristics.update_capture_history(attacker_pt, Square::new(m.to_sq()), stat_victim, cur_depth);
                 }
 
                 // Fail-high score softening + TT store
