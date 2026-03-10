@@ -21,8 +21,15 @@ dependencies = [
 name = "mikuengine"
 version = "0.1.0"
 dependencies = [
+ "polyglot-book-rs",
  "pyrrhic-rs",
 ]
+
+[[package]]
+name = "polyglot-book-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2800f836be0e33f035784fb1dba3e44204fc78098e232a7d67ea1a63db3c79d"
 
 [[package]]
 name = "pyrrhic-rs"
