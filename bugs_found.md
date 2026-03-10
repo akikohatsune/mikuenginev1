@@ -1,41 +1,27 @@
 
-### 🔴 Bug 17 — `go infinite` không được xử lý
 
-**File:** `src/uci.rs`, `parse_go`
+### 🔴 Bug 19 — `is_pseudo_legal` thiếu occupancy check cho pawn single push
+
+**File:** `src/board.rs`, line 141
 
 ```rust
-// Không có case "infinite" trong vòng lặp parse token
-match tokens[i] {
-    "depth" => { ... }
-    "wtime" => { ... }
-    // ... nhưng KHÔNG có "infinite"
-}
+if self.side_to_move == Color::White {
+    if to.0 == from.0 + 8 {
+        // ← THÂN HÀM RỖNG — không check ô đích có trống không!
+    } else if to.0 == from.0 + 16 && from.rank() == 1 {
+        if self.piece_on_sq[(from.0 + 8) as usize].is_some() { return false; }
 ```
 
-Khi GUI gửi `go infinite` (rất phổ biến trong phân tích), không có token nào match → `depth` giữ nguyên `= 6` mặc định, engine tìm đúng 6 tầng rồi trả `bestmove`. **Engine không thể phân tích vô hạn.**
+Double push có check `piece_on_sq[from+8]` đúng. Nhưng single push `from+8` không check gì cả.
+
+**Kịch bản trigger:** Có một TT move (pawn push e4) được lưu từ lần search trước. Ở position mới, ô e4 bị chiếm bởi quân khác. `is_pseudo_legal` trả về `true` → `make_move` được gọi → quân tại e4 bị overwrite (coi như captured) nhưng `captured_piece` trong undo sẽ ghi nhận, tuy nhiên `is_capture()` flag không được set → halfmove clock sai, zobrist sai, board state hỏng.
 
 **Fix:**
 ```rust
-"infinite" => { depth = 64; }
+if to.0 == from.0 + 8 {
+    if self.piece_on_sq[to.0 as usize].is_some() { return false; }
+}
+// tương tự cho Black: to.0 == from.0 - 8
 ```
-
----
-
-### 🟡 Bug 18 — `setoption name Clear Hash` bị silent fail
-
-**File:** `src/uci.rs`
-
-```rust
-let name = tokens[2].to_lowercase(); // chỉ lấy 1 từ
-```
-
-Option có tên nhiều từ đều bị ignore:
-- `Clear Hash` → `name = "clear"`, không match gì
-- `Move Overhead` → `name = "move"`, không match gì  
-- `Skill Level`, `Debug Log File`, `UCI_Chess960` (single word — fine)
-
-Trong thực tế `Clear Hash` dùng để reset TT trước ván mới — nếu không hoạt động, TT không được clear khi GUI yêu cầu.
-
-**Fix:** Parse tên multi-word bằng cách collect tất cả tokens giữa `name` và `value`.
 
 ---

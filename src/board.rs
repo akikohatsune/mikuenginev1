@@ -139,6 +139,9 @@ impl Board {
             } else {
                 if self.side_to_move == Color::White {
                     if to.0 == from.0 + 8 {
+                        if self.piece_on_sq[to.0 as usize].is_some() {
+                            return false;
+                        }
                     } else if to.0 == from.0 + 16 && from.rank() == 1 {
                         if self.piece_on_sq[(from.0 + 8) as usize].is_some() {
                             return false;
@@ -151,6 +154,9 @@ impl Board {
                     }
                 } else {
                     if to.0 == from.0 - 8 {
+                        if self.piece_on_sq[to.0 as usize].is_some() {
+                            return false;
+                        }
                     } else if to.0 == from.0 - 16 && from.rank() == 6 {
                         if self.piece_on_sq[(from.0 - 8) as usize].is_some() {
                             return false;

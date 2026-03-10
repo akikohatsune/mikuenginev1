@@ -9,3 +9,4 @@ package-lock.json
 package.json
 /android-ndk-r26d
 /releases
+*.exe
