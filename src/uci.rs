@@ -251,6 +251,7 @@ fn parse_go(
     let mut winc = 0;
     let mut binc = 0;
     let mut movetime = 0;
+    let mut movestogo = 0;
 
     let mut i = 1;
     while i < tokens.len() {
@@ -279,6 +280,10 @@ fn parse_go(
                 movetime = tokens[i + 1].parse().unwrap_or(0);
                 i += 1;
             }
+            "movestogo" => {
+                movestogo = tokens[i + 1].parse().unwrap_or(0);
+                i += 1;
+            }
             _ => (),
         }
         i += 1;
@@ -298,7 +303,7 @@ fn parse_go(
             (btime as u128, binc as u128)
         };
 
-        timer.init(time, inc, board.fullmove_number as usize);
+        timer.init(time, inc, movestogo, board.fullmove_number as usize);
         depth = 64;
     }
 
