@@ -8,10 +8,59 @@ use std::time::Instant;
 
 const INF: i32 = 50000;
 const MATE_SCORE: i32 = 48000;
+const TB_SCORE: i32 = 46000; // TB win score margin
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use crate::smp::SharedState;
+
+#[derive(Clone)]
+pub struct MikuAdapter;
+
+impl pyrrhic_rs::EngineAdapter for MikuAdapter {
+    fn pawn_attacks(color: pyrrhic_rs::Color, square: u64) -> u64 {
+        let bitboard = 1u64 << square;
+        if color == pyrrhic_rs::Color::White {
+            let mut attacks = 0;
+            if (bitboard & !crate::bitboard::FILE_A) != 0 {
+                attacks |= bitboard << 7;
+            }
+            if (bitboard & !crate::bitboard::FILE_H) != 0 {
+                attacks |= bitboard << 9;
+            }
+            attacks
+        } else {
+            let mut attacks = 0;
+            if (bitboard & !crate::bitboard::FILE_H) != 0 {
+                attacks |= bitboard >> 7;
+            }
+            if (bitboard & !crate::bitboard::FILE_A) != 0 {
+                attacks |= bitboard >> 9;
+            }
+            attacks
+        }
+    }
+
+    fn knight_attacks(square: u64) -> u64 {
+        crate::attacks::knight_attacks(crate::types::Square::new(square as u8)).0
+    }
+
+    fn bishop_attacks(square: u64, occupied: u64) -> u64 {
+        crate::attacks::bishop_attacks(crate::types::Square::new(square as u8), crate::bitboard::Bitboard(occupied)).0
+    }
+
+    fn rook_attacks(square: u64, occupied: u64) -> u64 {
+        crate::attacks::rook_attacks(crate::types::Square::new(square as u8), crate::bitboard::Bitboard(occupied)).0
+    }
+
+    fn queen_attacks(square: u64, occupied: u64) -> u64 {
+        crate::attacks::queen_attacks(crate::types::Square::new(square as u8), crate::bitboard::Bitboard(occupied)).0
+    }
+
+    fn king_attacks(square: u64) -> u64 {
+        crate::attacks::king_attacks(crate::types::Square::new(square as u8)).0
+    }
+}
 
 pub struct Search {
     pub tt: Arc<TranspositionTable>,
@@ -120,7 +169,7 @@ impl Search {
         beta: i32,
     ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return board.nnue.evaluate(board.side_to_move, &board.accumulator);
+            return crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
         }
         self.nodes += 1;
         self.check_time();
@@ -128,7 +177,7 @@ impl Search {
             return 0;
         }
 
-        let stand_pat = board.nnue.evaluate(board.side_to_move, &board.accumulator);
+        let stand_pat = crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
         if stand_pat >= beta {
             return beta;
         }
@@ -214,7 +263,7 @@ impl Search {
         cut_node: bool,
     ) -> i32 {
         if ply >= MAX_PLY - 1 {
-            return board.nnue.evaluate(board.side_to_move, &board.accumulator);
+            return crate::eval::endgame_evaluate(board, board.nnue.evaluate(board.side_to_move, &board.accumulator));
         }
 
         let true_hash = board.compute_hash();
@@ -253,6 +302,46 @@ impl Search {
             beta  = beta.min(MATE_SCORE - ply as i32 - 1);
             if alpha >= beta {
                 return alpha;
+            }
+        }
+
+        // Step 3.5. Tablebase Node Probing (WDL)
+        if ply > 0 && board.halfmove_clock == 0 && !root_node {
+            if let Some(tb) = &self.smp.tb {
+                let pieces_count = board.occupancies().count() as u32;
+                if pieces_count <= tb.max_pieces() {
+                    let w_bb = board.color_occupancy(crate::types::Color::White).0;
+                    let b_bb = board.color_occupancy(crate::types::Color::Black).0;
+                    let k_bb = board.piece_bb(PieceType::King).0;
+                    let q_bb = board.piece_bb(PieceType::Queen).0;
+                    let r_bb = board.piece_bb(PieceType::Rook).0;
+                    let b_bb_pc = board.piece_bb(PieceType::Bishop).0;
+                    let n_bb = board.piece_bb(PieceType::Knight).0;
+                    let p_bb = board.piece_bb(PieceType::Pawn).0;
+                    let ep = board.en_passant.map_or(0, |sq| sq.0 as u32);
+                    let turn = board.side_to_move == crate::types::Color::White;
+
+                    if let Ok(wdl) = tb.probe_wdl(w_bb, b_bb, k_bb, q_bb, r_bb, b_bb_pc, n_bb, p_bb, ep, turn) {
+                        let mut tb_value = match wdl {
+                            pyrrhic_rs::WdlProbeResult::Win => TB_SCORE - ply as i32,
+                            pyrrhic_rs::WdlProbeResult::Loss => -TB_SCORE + ply as i32,
+                            pyrrhic_rs::WdlProbeResult::Draw | pyrrhic_rs::WdlProbeResult::BlessedLoss | pyrrhic_rs::WdlProbeResult::CursedWin => draw_score,
+                        };
+
+                        let tb_bound = if tb_value > draw_score {
+                            NodeType::Exact // Win
+                        } else if tb_value < draw_score {
+                            NodeType::Exact // Loss
+                        } else {
+                            NodeType::Exact // Draw
+                        };
+
+                        if tb_bound == NodeType::Exact || (tb_bound == NodeType::Beta && tb_value >= beta) || (tb_bound == NodeType::Alpha && tb_value <= alpha) {
+                            self.tt.store(board.zobrist_key, 0, tb_value, tb_bound, Move::none(), pv_node);
+                            return tb_value;
+                        }
+                    }
+                }
             }
         }
 
@@ -325,7 +414,7 @@ impl Search {
             ss[ply].static_eval = SearchStack::NONE_EVAL;
             -INF
         } else if tt_hit {
-            let raw = board.nnue.evaluate(side, &board.accumulator);
+            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator));
             let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
             ss[ply].static_eval = corrected;
             // Use tt_score as better eval if bound agrees
@@ -334,7 +423,7 @@ impl Search {
                 tt_score
             } else { corrected }
         } else {
-            let raw = board.nnue.evaluate(side, &board.accumulator);
+            let raw = crate::eval::endgame_evaluate(board, board.nnue.evaluate(side, &board.accumulator));
             let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
             ss[ply].static_eval = corrected;
             corrected
@@ -665,6 +754,14 @@ impl Search {
 
                 // Promotion extension
                 if is_promo { extension = extension.max(1); }
+
+                // Pawn push to 7th rank extension
+                if attacker_pt == PieceType::Pawn && !is_promo {
+                    let to_rank = Square::new(m.to_sq()).rank();
+                    if (move_side == crate::types::Color::White && to_rank == 6) || (move_side == crate::types::Color::Black && to_rank == 1) {
+                        extension = extension.max(1);
+                    }
+                }
             }
 
             let new_depth = (cur_depth as i32 - 1 + extension).max(0) as u8;
@@ -929,6 +1026,66 @@ impl Search {
         } else {
             1
         };
+
+        // Root Probing for Syzygy DTZ
+        if let Some(tb) = &self.smp.tb {
+            let pieces_count = board.occupancies().count() as u32;
+            if pieces_count <= tb.max_pieces() && board.halfmove_clock == 0 {
+                let w_bb = board.color_occupancy(crate::types::Color::White).0;
+                let b_bb = board.color_occupancy(crate::types::Color::Black).0;
+                let k_bb = board.piece_bb(PieceType::King).0;
+                let q_bb = board.piece_bb(PieceType::Queen).0;
+                let r_bb = board.piece_bb(PieceType::Rook).0;
+                let b_bb_pc = board.piece_bb(PieceType::Bishop).0;
+                let n_bb = board.piece_bb(PieceType::Knight).0;
+                let p_bb = board.piece_bb(PieceType::Pawn).0;
+                let ep = board.en_passant.map_or(0, |sq| sq.0 as u32);
+                let turn = board.side_to_move == crate::types::Color::White;
+
+                if let Ok(dtz_res) = tb.probe_root(w_bb, b_bb, k_bb, q_bb, r_bb, b_bb_pc, n_bb, p_bb, board.halfmove_clock as u32, ep, turn) {
+                    if let pyrrhic_rs::DtzProbeValue::DtzResult(res) = dtz_res.root {
+                        if dtz_res.num_moves > 0 {
+                            // Find the best DTZ move from the moves array
+                            // A perfect implementation would filter `root_moves`, but for simplicity
+                            // if it's a decisive win or draw, we'll try to find the move that matches `res.to_square`
+                            let mut best_dtz_move = Move::none();
+                            for mv_res in dtz_res.moves.iter().take(dtz_res.num_moves) {
+                                if let pyrrhic_rs::DtzProbeValue::DtzResult(rm) = mv_res {
+                                    if rm.wdl == res.wdl && rm.dtz == res.dtz {
+                                        // Reconstruct the internal Move format (basic)
+                                        let from = rm.from_square as usize;
+                                        let to = rm.to_square as usize;
+                                        // This doesn't perfectly match MikuEngine's move flags (castling, etc)
+                                        // so we search legal moves that match from/to.
+                                        let mut moves = crate::movegen::MoveList::new();
+                                        crate::movegen::generate_pseudo_legal_moves(board, &mut moves);
+                                        for i in 0..moves.count {
+                                            let m = moves.moves[i];
+                                            if board.is_pseudo_legal(m) && m.from_sq() == from as u8 && m.to_sq() == to as u8 {
+                                                if rm.promotion == pyrrhic_rs::Piece::Pawn || m.is_promotion() {
+                                                     best_dtz_move = m;
+                                                     break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if best_dtz_move != Move::none() {
+                                let score = match res.wdl {
+                                    pyrrhic_rs::WdlProbeResult::Win => TB_SCORE,
+                                    pyrrhic_rs::WdlProbeResult::Loss => -TB_SCORE,
+                                    pyrrhic_rs::WdlProbeResult::Draw | pyrrhic_rs::WdlProbeResult::BlessedLoss | pyrrhic_rs::WdlProbeResult::CursedWin => 0,
+                                };
+                                println!("info depth 1 score cp {} time 1 pv {:?}", score, best_dtz_move);
+                                return best_dtz_move;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Initialize SearchStack: ss[0..MAX_PLY+6]
         let mut ss = vec![SearchStack::new(); MAX_PLY + 10];

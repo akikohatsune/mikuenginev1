@@ -128,6 +128,11 @@ impl Move {
     }
 
     #[inline(always)]
+    pub fn none() -> Self {
+        Move(0)
+    }
+
+    #[inline(always)]
     pub fn from_sq(self) -> u8 {
         (self.0 & 0x3F) as u8
     }

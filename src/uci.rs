@@ -13,6 +13,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
     let stdin = io::stdin();
     let mut board = Board::new(nnue.clone());
     let mut tt = Arc::new(TranspositionTable::new(16));
+    let mut tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>> = None;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut num_threads = 1;
 
@@ -64,6 +65,15 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                         if let Ok(mb) = tokens[4].parse::<usize>() {
                             tt = Arc::new(TranspositionTable::new(mb));
                         }
+                    } else if name == "syzygypath" && tokens.len() >= 5 {
+                        let path_tokens = &tokens[4..];
+                        let path = path_tokens.join(" ");
+                        if let Ok(tablebases) = pyrrhic_rs::TableBases::<crate::search::MikuAdapter>::new(&path) {
+                            tb = Some(Arc::new(tablebases));
+                            println!("info string Syzygy tablebases initialized successfully");
+                        } else {
+                            println!("info string Failed to load Syzygy tablebases from {}", path);
+                        }
                     }
                 }
             }
@@ -79,6 +89,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                 parse_go(
                     board.clone(),
                     tt.clone(),
+                    tb.clone(),
                     stop_flag.clone(),
                     num_threads,
                     &tokens,
@@ -138,7 +149,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                     // Let's run it synchronously.
                     
                     let mut search = Box::new(Search::new(
-                        Arc::new(SharedState::new(tt.clone(), stop_flag.clone(), vec![])),
+                        Arc::new(SharedState::new(tt.clone(), tb.clone(), stop_flag.clone(), vec![])),
                         0,
                     ));
                     
@@ -241,6 +252,7 @@ fn parse_position(board: &mut Board, tokens: &[&str], nnue: Arc<NNUE>) {
 fn parse_go(
     board: Board,
     tt: Arc<TranspositionTable>,
+    tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>>,
     stop: Arc<AtomicBool>,
     num_threads: usize,
     tokens: &[&str],
@@ -320,7 +332,7 @@ fn parse_go(
                     move_vec.push(root_moves.moves[i]);
                 }
             }
-            let shared_state = Arc::new(SharedState::new(tt.clone(), stop.clone(), move_vec));
+            let shared_state = Arc::new(SharedState::new(tt.clone(), tb.clone(), stop.clone(), move_vec));
 
             let mut workers = vec![];
 
@@ -396,7 +408,7 @@ pub fn run_bench(nnue: Arc<NNUE>, args: &[String]) {
         stop_flag.store(false, Ordering::Relaxed);
         
         let mut search = Box::new(Search::new(
-            Arc::new(SharedState::new(tt.clone(), stop_flag.clone(), vec![])),
+            Arc::new(SharedState::new(tt.clone(), None, stop_flag.clone(), vec![])),
             0,
         ));
         

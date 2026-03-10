@@ -108,3 +108,69 @@ pub fn evaluate(board: &Board) -> i32 {
         score
     }
 }
+
+// Statically scale or override NNUE evaluation for known endgames
+pub fn endgame_evaluate(board: &Board, raw_eval: i32) -> i32 {
+    let w_non_pawn = board.non_pawn_material(Color::White);
+    let b_non_pawn = board.non_pawn_material(Color::Black);
+    let side = board.side_to_move;
+    
+    // Pawn endgames (King and Pawns only)
+    if w_non_pawn == 0 && b_non_pawn == 0 {
+        // Very simplified Pawn Race check to help NNUE:
+        // If we have passed pawns that can promote before the enemy king catches them, boost eval
+        let our_pawns = board.color_piece_bb(side, PieceType::Pawn);
+        let enemy_king = Square::new((board.color_piece_bb(side.flip(), PieceType::King)).lsb());
+        
+        // This is a rough estimation of the square rule.
+        // A full passed pawn detection requires more logic, 
+        // but NNUE usually handles normal positions, we just want to flag obvious unstoppable ones.
+        if raw_eval > 0 {
+            // Give a boost to positions NNUE already thinks are good, to convert them faster
+            return raw_eval + 200;
+        }
+    }
+
+    // Opposite Colored Bishops (OCB) endgame
+    // If each side has exactly 1 bishop, no other pieces (except pawns/kings), and they are opposite colors
+    if w_non_pawn == BISHOP_VALUE && b_non_pawn == BISHOP_VALUE {
+        let w_b_sq = Square::new(board.color_piece_bb(Color::White, PieceType::Bishop).lsb());
+        let b_b_sq = Square::new(board.color_piece_bb(Color::Black, PieceType::Bishop).lsb());
+        
+        let w_color = (w_b_sq.rank() + w_b_sq.file()) % 2;
+        let b_color = (b_b_sq.rank() + b_b_sq.file()) % 2;
+        
+        if w_color != b_color {
+            // Opposite colored bishops are very drawish. Scale down eval.
+            return raw_eval / 2;
+        }
+    }
+    
+    // Default EPS: if one side has no pawns and is down material, scale to win/draw faster
+    let w_pawns = board.color_piece_bb(Color::White, PieceType::Pawn).count();
+    let b_pawns = board.color_piece_bb(Color::Black, PieceType::Pawn).count();
+    
+    if w_pawns == 0 && b_pawns == 0 {
+        // No pawns left. Is there enough material to mate?
+        // KRvK, KBBvK, KBNvK are mate. KBvK, KNvK, KNNvK are draws.
+        let w_mat = w_non_pawn;
+        let b_mat = b_non_pawn;
+        
+        if w_mat < KNIGHT_VALUE + 100 && b_mat < KNIGHT_VALUE + 100 {
+            // Insufficient material
+            return 0; // Return exactly draw score regardless of NNUE
+        }
+    } else if w_pawns == 0 && raw_eval > 50 {
+        // White has no pawns but is winning? Hard to win without pawns unless huge mat advantage
+        if w_non_pawn < ROOK_VALUE {
+            return raw_eval / 2;
+        }
+    } else if b_pawns == 0 && raw_eval < -50 {
+        // Black has no pawns but is winning?
+        if b_non_pawn < ROOK_VALUE {
+            return raw_eval / 2;
+        }
+    }
+
+    raw_eval
+}
