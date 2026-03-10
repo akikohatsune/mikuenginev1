@@ -47,6 +47,16 @@ fn find_nnue_file() -> Option<PathBuf> {
 }
 
 fn main() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024) // 32MB
+        .name("main".to_string())
+        .spawn(|| real_main())
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn real_main() {
     // Initialize magic bitboard tables before anything else
     attacks::init_magics();
 

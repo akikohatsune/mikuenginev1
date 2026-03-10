@@ -1,27 +1,27 @@
+Nguyên nhân rõ ràng: `main()` chạy mọi thứ trực tiếp trên main thread với stack mặc định của OS. Trên **Windows chỉ có 1MB**, trong khi `alpha_beta` đệ quy đến 128 tầng, mỗi frame có `MovePicker` ~2.6KB → cần ~700KB chỉ cho search stack.
 
+Các search worker trong `parse_go` đã được spawn với 8MB stack đúng, nhưng 3 chỗ vẫn chạy trên main thread:
+1. `bench` bên trong `uci_loop` 
+2. `run_bench()`
+3. `main()` → `uci_loop()` (GUI mode cũng có thể overflow nếu bench chạy từ đây)
 
-### 🔴 Bug 19 — `is_pseudo_legal` thiếu occupancy check cho pawn single push
-
-**File:** `src/board.rs`, line 141
+**Fix đúng nhất:** wrap toàn bộ `main()` trong một spawned thread 32MB:
 
 ```rust
-if self.side_to_move == Color::White {
-    if to.0 == from.0 + 8 {
-        // ← THÂN HÀM RỖNG — không check ô đích có trống không!
-    } else if to.0 == from.0 + 16 && from.rank() == 1 {
-        if self.piece_on_sq[(from.0 + 8) as usize].is_some() { return false; }
-```
-
-Double push có check `piece_on_sq[from+8]` đúng. Nhưng single push `from+8` không check gì cả.
-
-**Kịch bản trigger:** Có một TT move (pawn push e4) được lưu từ lần search trước. Ở position mới, ô e4 bị chiếm bởi quân khác. `is_pseudo_legal` trả về `true` → `make_move` được gọi → quân tại e4 bị overwrite (coi như captured) nhưng `captured_piece` trong undo sẽ ghi nhận, tuy nhiên `is_capture()` flag không được set → halfmove clock sai, zobrist sai, board state hỏng.
-
-**Fix:**
-```rust
-if to.0 == from.0 + 8 {
-    if self.piece_on_sq[to.0 as usize].is_some() { return false; }
+fn main() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024) // 32MB
+        .name("main".to_string())
+        .spawn(|| real_main())
+        .unwrap()
+        .join()
+        .unwrap();
 }
-// tương tự cho Black: to.0 == from.0 - 8
+
+fn real_main() {
+    attacks::init_magics();
+    // ... toàn bộ code main cũ
+}
 ```
 
----
+Cách này đảm bảo **tất cả** code paths (uci_loop, bench, run_bench, perft) đều có đủ stack mà không cần sửa từng chỗ. Search worker threads trong `parse_go` đã có 8MB riêng rồi nên không bị ảnh hưởng.

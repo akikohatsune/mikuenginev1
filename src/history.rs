@@ -8,7 +8,7 @@ pub struct Heuristics {
     pub killers: [[Move; 2]; MAX_PLY], // [Ply][Slot]
     pub countermoves: [[Move; 64]; 6], // [PrevPieceType][PrevToSq] -> Move
     pub capture_history: [[[i32; 6]; 64]; 6], // [AttackerPT][ToSq][VictimPT] — default -689
-    pub cont_history: [[[[i32; 64]; 6]; 64]; 6], // [PrevPT][PrevTo][CurPT][CurTo] — default -529
+    pub cont_history: Box<[[[[i32; 64]; 6]; 64]; 6]>, // [PrevPT][PrevTo][CurPT][CurTo] — default -529
     pub pawn_history: [[[i32; 64]; 64]; 2], // [Color][FromSq][ToSq]
     pub minor_piece_history: [[[i32; 64]; 64]; 2], // [Color][FromSq][ToSq]
     pub low_ply_history: [[i32; 4096]; 16], // [Ply][Move::raw()] — default 97
@@ -16,8 +16,8 @@ pub struct Heuristics {
     pub tt_move_history: i32,           // Like Stockfish ttMoveHistory
 
     // Correction Heuristics
-    pub non_pawn_corr: [[i32; 16384]; 2], // [Color][MaterialHash % 16384]
-    pub cont_corr: [[[[i32; 64]; 6]; 64]; 6], // [PrevPT][PrevTo][CurPT][CurTo]
+    pub non_pawn_corr: Box<[[i32; 16384]; 2]>, // [Color][MaterialHash % 16384]
+    pub cont_corr: Box<[[[[i32; 64]; 6]; 64]; 6]>, // [PrevPT][PrevTo][CurPT][CurTo]
 }
 
 impl Default for Heuristics {
@@ -34,14 +34,14 @@ impl Heuristics {
             killers: [[Move::new(0, 0, 0); 2]; MAX_PLY],
             countermoves: [[Move::new(0, 0, 0); 64]; 6],
             capture_history: [[[-689; 6]; 64]; 6],
-            cont_history: [[[[-529; 64]; 6]; 64]; 6],
+            cont_history: vec![[[[-529; 64]; 6]; 64]; 6].into_boxed_slice().try_into().unwrap(),
             pawn_history: [[[0; 64]; 64]; 2],
             minor_piece_history: [[[0; 64]; 64]; 2],
             low_ply_history: [[97; 4096]; 16],
             static_evals: [0; MAX_PLY],
             tt_move_history: 0,
-            non_pawn_corr: [[0; 16384]; 2],
-            cont_corr: [[[[8; 64]; 6]; 64]; 6], // Stockfish default 8
+            non_pawn_corr: vec![[0; 16384]; 2].into_boxed_slice().try_into().unwrap(),
+            cont_corr: vec![[[[8; 64]; 6]; 64]; 6].into_boxed_slice().try_into().unwrap(),
         };
         h
     }
@@ -59,14 +59,14 @@ impl Heuristics {
         self.killers = [[Move::new(0, 0, 0); 2]; MAX_PLY];
         self.countermoves = [[Move::new(0, 0, 0); 64]; 6];
         self.capture_history = [[[-689; 6]; 64]; 6];
-        self.cont_history = [[[[-529; 64]; 6]; 64]; 6];
+        self.cont_history.copy_from_slice(&vec![[[[-529; 64]; 6]; 64]; 6]);
         self.pawn_history = [[[0; 64]; 64]; 2];
         self.minor_piece_history = [[[0; 64]; 64]; 2];
         self.low_ply_history = [[97; 4096]; 16];
         self.static_evals = [0; MAX_PLY];
         self.tt_move_history = 0;
-        self.non_pawn_corr = [[0; 16384]; 2];
-        self.cont_corr = [[[[8; 64]; 6]; 64]; 6];
+        self.non_pawn_corr.copy_from_slice(&vec![[0; 16384]; 2]);
+        self.cont_corr.copy_from_slice(&vec![[[[8; 64]; 6]; 64]; 6]);
     }
 
     /// History Gravity update
