@@ -96,6 +96,19 @@ fn main() {
         };
         let mut board = board::Board::new(nnue.clone());
         perft::divide(&mut board, depth);
+    } else if args.len() > 1 && args[1] == "bench" {
+        // Run bench without GUI interaction. Pass mock commands to uci module.
+        // Or simply execute uci bench directly and exit.
+        println!("Running benchmark from command line...");
+        let stdin = format!("bench\nquit\n");
+        // We can just pipe exactly "bench" then "quit" into uci loop?
+        // Actually uci_loop reads stdin. It's easier to refactor uci loop slightly or send it through a channel.
+        // A simple hack is to spawn a thread that pushes "bench\nquit\n" to uci loop but since we read from stdin, that's tricky.
+        // Let's extract the bench logic or just do what Stockfish does - inject it into the uci commands?
+        // Since `uci_loop` listens to standard input, testing natively is easiest by setting up a custom function for bench.
+        // For simplicity now, let's just instruct users to use "bench" inside UCI or make a dedicated bench fn.
+        // Let's make a dedicated run_bench function in uci.rs or just call the logic.
+        uci::run_bench(nnue.clone(), &args[2..]);
     } else {
         uci::uci_loop(nnue);
     }

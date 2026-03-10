@@ -82,7 +82,7 @@ impl TimeManager {
     // 3. PV Stability Detection
     pub fn update_pv(&mut self, pv_move: u16) {
         if self.last_pv_move != 0 && self.last_pv_move != pv_move {
-            self.opt_time = (self.opt_time * 15) / 10;
+            self.opt_time = self.opt_time.saturating_mul(15) / 10;
         }
         self.last_pv_move = pv_move;
     }
@@ -100,15 +100,15 @@ impl TimeManager {
     // 5. Aspiration Window Fail Handling
     pub fn aspiration_fail(&mut self, fail_low: bool) {
         if fail_low {
-            self.opt_time = (self.opt_time * 15) / 10;
+            self.opt_time = self.opt_time.saturating_mul(15) / 10;
         } else {
-            self.opt_time = (self.opt_time * 13) / 10;
+            self.opt_time = self.opt_time.saturating_mul(13) / 10;
         }
     }
 
     // 6. Move Importance Scaling
     pub fn move_importance_high(&mut self) {
-        self.opt_time = (self.opt_time * 13) / 10;
+        self.opt_time = self.opt_time.saturating_mul(13) / 10;
     }
 
     // 9. Node Speed Prediction

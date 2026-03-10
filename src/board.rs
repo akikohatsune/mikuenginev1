@@ -944,4 +944,69 @@ impl Board {
 
         Some(board)
     }
+
+    pub fn fen(&self) -> String {
+        let mut fen = String::new();
+        let mut empty = 0;
+
+        for rank in (0..8).rev() {
+            for file in 0..8 {
+                let sq = rank * 8 + file;
+                if let Some(piece) = self.piece_on_sq[sq as usize] {
+                    if empty > 0 {
+                        fen.push_str(&empty.to_string());
+                        empty = 0;
+                    }
+                    let ch = match piece.piece_type() {
+                        PieceType::Pawn => 'p',
+                        PieceType::Knight => 'n',
+                        PieceType::Bishop => 'b',
+                        PieceType::Rook => 'r',
+                        PieceType::Queen => 'q',
+                        PieceType::King => 'k',
+                    };
+                    if piece.color() == Color::White {
+                        fen.push(ch.to_ascii_uppercase());
+                    } else {
+                        fen.push(ch);
+                    }
+                } else {
+                    empty += 1;
+                }
+            }
+            if empty > 0 {
+                fen.push_str(&empty.to_string());
+                empty = 0;
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+
+        fen.push(' ');
+        fen.push(if self.side_to_move == Color::White { 'w' } else { 'b' });
+        fen.push(' ');
+
+        let mut castling = String::new();
+        if self.castling.has_wk() { castling.push('K'); }
+        if self.castling.has_wq() { castling.push('Q'); }
+        if self.castling.has_bk() { castling.push('k'); }
+        if self.castling.has_bq() { castling.push('q'); }
+        if castling.is_empty() { castling.push('-'); }
+        fen.push_str(&castling);
+        fen.push(' ');
+
+        if let Some(ep) = self.en_passant {
+            let file = (ep.0 % 8) as u8 + b'a';
+            let rank = (ep.0 / 8) as u8 + b'1';
+            fen.push(file as char);
+            fen.push(rank as char);
+        } else {
+            fen.push('-');
+        }
+
+        fen.push_str(&format!(" {} {}", self.halfmove_clock, self.fullmove_number));
+
+        fen
+    }
 }

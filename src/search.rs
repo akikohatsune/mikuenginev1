@@ -1023,14 +1023,17 @@ impl Search {
             }
 
             if self.thread_id == 0 {
+                // Stockfish info string format:
+                // info depth {d} seldepth {d} multipv 1 score {score} nodes {nodes} nps {nps} hashfull {hashfull} tbhits 0 time {time} pv {pv}
                 println!(
-                    "info depth {} nodes {} time {} nps {} hashfull {} score {} pv {}",
+                    "info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}",
                     d,
+                    d, // MikuEngine doesn't track seldepth yet, so we just mirror depth
+                    score_str,
                     self.nodes,
-                    elapsed,
                     nps,
                     hashfull,
-                    score_str,
+                    elapsed,
                     pv_str.trim()
                 );
 

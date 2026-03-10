@@ -31,10 +31,23 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
 
         match cmd {
             "uci" => {
-                println!("id name mikuchess");
+                println!("id name MikuEngine");
                 println!("id author komekokomi");
-                println!("option name Hash type spin default 16 min 1 max 1024");
+                println!("option name Debug Log File type string default");
                 println!("option name Threads type spin default 1 min 1 max 64");
+                println!("option name Hash type spin default 16 min 1 max 1024");
+                println!("option name Clear Hash type button");
+                println!("option name Ponder type check default false");
+                println!("option name MultiPV type spin default 1 min 1 max 500");
+                println!("option name Skill Level type spin default 20 min 0 max 20");
+                println!("option name Move Overhead type spin default 10 min 0 max 5000");
+                println!("option name nodestime type spin default 0 min 0 max 10000");
+                println!("option name UCI_Chess960 type check default false");
+                println!("option name UCI_ShowWDL type check default false");
+                println!("option name SyzygyPath type string default <empty>");
+                println!("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
+                println!("option name Syzygy50MoveRule type check default true");
+                println!("option name SyzygyProbeLimit type spin default 7 min 0 max 7");
                 println!("uciok");
             }
             "isready" => {
@@ -73,6 +86,75 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
             }
             "stop" => {
                 stop_flag.store(true, Ordering::Relaxed);
+            }
+            "bench" => {
+                // Parse bench arguments: bench [hash] [threads] [depth] [fen]
+                let mut hash = 16;
+                let mut threads = 1;
+                let mut depth = 13;
+                let mut current_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string();
+
+                let mut arg_idx = 1;
+                if tokens.len() > arg_idx {
+                    if let Ok(val) = tokens[arg_idx].parse::<usize>() {
+                        hash = val;
+                        arg_idx += 1;
+                    }
+                }
+                if tokens.len() > arg_idx {
+                    if let Ok(val) = tokens[arg_idx].parse::<usize>() {
+                        threads = val.max(1).min(64);
+                        arg_idx += 1;
+                    }
+                }
+                if tokens.len() > arg_idx {
+                    if let Ok(val) = tokens[arg_idx].parse::<usize>() {
+                        depth = val.max(1);
+                        arg_idx += 1;
+                    }
+                }
+                if tokens.len() > arg_idx {
+                    if tokens[arg_idx] == "current" {
+                        current_fen = board.fen();
+                    } else {
+                        current_fen = tokens[arg_idx..].join(" ");
+                    }
+                }
+
+                // Temporary set those values for bench execution
+                tt = Arc::new(TranspositionTable::new(hash));
+                num_threads = threads;
+
+                if let Some(mut b) = Board::from_fen(&current_fen, nnue.clone()) {
+                    println!("Running benchmark...");
+                    
+                    let start_time = std::time::Instant::now();
+                    
+                    // Call parse_go with depth to trigger search
+                    stop_flag.store(false, Ordering::Relaxed);
+                    // We need a synchronous bench run.
+                    // The easiest way is to re-use the search logic directly here for thread 0,
+                    // or carefully wait for the uci_supervisor thread to finish.
+                    // Let's run it synchronously.
+                    
+                    let mut search = Box::new(Search::new(
+                        Arc::new(SharedState::new(tt.clone(), stop_flag.clone(), vec![])),
+                        0,
+                    ));
+                    
+                    let best = search.iterate(&mut b, depth as u8);
+                    
+                    let elapsed = start_time.elapsed().as_millis().max(1);
+                    let nodes = search.nodes;
+                    let nps = (nodes as u128 * 1000) / elapsed;
+
+                    println!("===========================");
+                    println!("Total time (ms) : {}", elapsed);
+                    println!("Nodes searched  : {}", nodes);
+                    println!("Nodes/second    : {}", nps);
+                } else {
+                    println!("Error: Invalid FEN for bench.");
+                }
             }
             "quit" => {
                 stop_flag.store(true, Ordering::Relaxed);
@@ -269,3 +351,62 @@ fn parse_go(
             }
         });
 }
+
+pub fn run_bench(nnue: Arc<NNUE>, args: &[String]) {
+    let mut hash = 16;
+    let mut threads = 1;
+    let mut depth = 13;
+    let mut current_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string();
+
+    let mut arg_idx = 0;
+    if args.len() > arg_idx {
+        if let Ok(val) = args[arg_idx].parse::<usize>() {
+            hash = val;
+            arg_idx += 1;
+        }
+    }
+    if args.len() > arg_idx {
+        if let Ok(val) = args[arg_idx].parse::<usize>() {
+            threads = val.max(1).min(64);
+            arg_idx += 1;
+        }
+    }
+    if args.len() > arg_idx {
+        if let Ok(val) = args[arg_idx].parse::<usize>() {
+            depth = val.max(1);
+            arg_idx += 1;
+        }
+    }
+    if args.len() > arg_idx {
+        current_fen = args[arg_idx..].join(" ");
+    }
+
+    let tt = Arc::new(TranspositionTable::new(hash));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    if let Some(mut b) = Board::from_fen(&current_fen, nnue) {
+        println!("Running benchmark...");
+        
+        let start_time = std::time::Instant::now();
+        stop_flag.store(false, Ordering::Relaxed);
+        
+        let mut search = Box::new(Search::new(
+            Arc::new(SharedState::new(tt.clone(), stop_flag.clone(), vec![])),
+            0,
+        ));
+        
+        search.iterate(&mut b, depth as u8);
+        
+        let elapsed = start_time.elapsed().as_millis().max(1);
+        let nodes = search.nodes;
+        let nps = (nodes as u128 * 1000) / elapsed;
+
+        println!("===========================");
+        println!("Total time (ms) : {}", elapsed);
+        println!("Nodes searched  : {}", nodes);
+        println!("Nodes/second    : {}", nps);
+    } else {
+        println!("Error: Invalid FEN for bench.");
+    }
+}
+
