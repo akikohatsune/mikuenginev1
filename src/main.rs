@@ -1,3 +1,4 @@
+#![allow(unused_mut)]
 pub mod attacks;
 pub mod bitboard;
 pub mod board;

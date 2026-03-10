@@ -1,5 +1,3 @@
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
+[build]
+# Suppress warnings globally to bypass rustc 1.94.0 ICE in liveness check
+rustflags = ["--cap-lints", "allow"]

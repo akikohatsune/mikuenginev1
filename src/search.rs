@@ -28,16 +28,56 @@ pub struct Search {
     pub pv_table: [[Move; MAX_PLY]; MAX_PLY],
     pub pv_length: [usize; MAX_PLY],
     pub lmr_table: [[u8; 64]; 64],
+    // Stockfish-style integer reductions table: reductions[i] = int(2747/128 * ln(i))
+    pub reductions: [i32; 64],
+    // NMP minimum ply for verification search
+    pub nmp_min_ply: usize,
+}
+
+/// Per-node state threaded through the search (equivalent to Stockfish's Stack)
+#[derive(Clone, Copy)]
+pub struct SearchStack {
+    pub static_eval: i32,
+    pub tt_pv: bool,
+    pub in_check: bool,
+    pub cutoff_cnt: i32,
+    pub reduction: i32,
+    pub stat_score: i32,
+    pub move_count: usize,
+    pub current_move: Option<Move>,
+    pub excluded_move: Option<Move>,
+}
+
+impl SearchStack {
+    pub const NONE_EVAL: i32 = i32::MIN;
+    pub fn new() -> Self {
+        SearchStack {
+            static_eval: Self::NONE_EVAL,
+            tt_pv: false,
+            in_check: false,
+            cutoff_cnt: 0,
+            reduction: 0,
+            stat_score: 0,
+            move_count: 0,
+            current_move: None,
+            excluded_move: None,
+        }
+    }
 }
 
 impl Search {
     pub fn new(smp: Arc<SharedState>, thread_id: usize) -> Self {
-        let mut lmr_table = [[0; 64]; 64];
+        let mut lmr_table = [[0u8; 64]; 64];
         for d in 1..64 {
             for m in 1..64 {
                 let reduction = 0.75 + (d as f64).ln() * (m as f64).ln() / 2.25;
                 lmr_table[d][m] = reduction as u8;
             }
+        }
+        // Stockfish integer reductions: reductions[i] = int(2747/128.0 * ln(i))
+        let mut reductions = [0i32; 64];
+        for i in 1..64 {
+            reductions[i] = ((2747.0 / 128.0) * (i as f64).ln()) as i32;
         }
 
         Search {
@@ -55,6 +95,8 @@ impl Search {
             pv_table: [[Move::new(0, 0, 0); MAX_PLY]; MAX_PLY],
             pv_length: [0; MAX_PLY],
             lmr_table,
+            reductions,
+            nmp_min_ply: 0,
         }
     }
 
@@ -72,16 +114,13 @@ impl Search {
     pub fn quiescence(
         &mut self,
         board: &mut Board,
+        ss: &mut [SearchStack],
+        ply: usize,
         mut alpha: i32,
         beta: i32,
-        q_ply: usize,
     ) -> i32 {
-        if q_ply > 200 {
-            println!(
-                "q_ply max reached! stand_pat={}",
-                board.nnue.evaluate(board.side_to_move, &board.accumulator)
-            );
-            std::process::exit(1);
+        if ply >= MAX_PLY - 1 {
+            return board.nnue.evaluate(board.side_to_move, &board.accumulator);
         }
         self.nodes += 1;
         self.check_time();
@@ -144,7 +183,7 @@ impl Search {
             };
 
             if !in_check {
-                let score = -self.quiescence(board, -beta, -alpha, q_ply + 1);
+                let score = -self.quiescence(board, ss, ply + 1, -beta, -alpha);
                 board.unmake_move(m, &undo);
                 if score >= beta {
                     return beta;
@@ -161,40 +200,27 @@ impl Search {
     }
 
     // ------------------------------------------------------------------
-    //   FAIL-SOFT ALPHA-BETA WITH PVS
+    //   FAIL-SOFT ALPHA-BETA WITH PVS  (Stockfish-aligned)
     // ------------------------------------------------------------------
+    #[inline(never)]
     pub fn alpha_beta(
         &mut self,
         board: &mut Board,
+        ss: &mut [SearchStack],   // ss[ply] is current node
+        ply: usize,
         mut depth: u8,
         mut alpha: i32,
         mut beta: i32,
-        ply: usize,
-        prev_move: Option<Move>,
         cut_node: bool,
     ) -> i32 {
-        if ply > 200 {
-            println!(
-                "max ply reached! depth={} in_check={} prev_move={:?} tt_hash={:x}",
-                depth,
-                board.is_square_attacked(
-                    Square::new(
-                        (board.piece_bb(PieceType::King)
-                            & board.color_occupancy(board.side_to_move))
-                        .lsb()
-                    ),
-                    board.side_to_move.flip()
-                ),
-                prev_move,
-                board.zobrist_key
-            );
-            std::process::exit(1);
+        if ply >= MAX_PLY - 1 {
+            return board.nnue.evaluate(board.side_to_move, &board.accumulator);
         }
 
         let true_hash = board.compute_hash();
         if board.zobrist_key != true_hash {
             eprintln!(
-                "HASH DRIFT DETECTED IN NEGAMAX! incrementally={:x}, true={:x}, ply={}",
+                "HASH DRIFT IN NEGAMAX! inc={:x}, true={:x}, ply={}",
                 board.zobrist_key, true_hash, ply
             );
             std::process::exit(1);
@@ -206,766 +232,653 @@ impl Search {
             return 0;
         }
 
+        // Initialise PV length
         self.pv_length[ply] = ply;
 
-        let total_pieces = board.colors[crate::types::Color::White as usize].count()
-            + board.colors[crate::types::Color::Black as usize].count();
+        let pv_node = beta - alpha > 1;
+        let root_node = ply == 0;
 
-        let mut pressure = 0.0;
-        if total_pieces <= 12 {
-            let lazy_eval = board.nnue.evaluate(board.side_to_move, &board.accumulator);
-            if lazy_eval > 120 {
-                pressure = ((lazy_eval as f32 - 120.0) / 200.0).clamp(0.0, 1.0);
-            }
-        }
-
-        // Draw detection
-        let mut draw_score = -1 + (self.nodes & 2) as i32;
+        // Step 2. Draw detection
+        let draw_score = -1 + (self.nodes & 2) as i32;
         if board.halfmove_clock >= 100 {
             return draw_score;
         }
         if ply > 0 && board.is_repetition() {
-            if pressure > 0.0 {
-                draw_score -= (pressure * 50.0) as i32;
-            }
             return draw_score;
         }
 
-        // Mate distance pruning
-        alpha = alpha.max(-MATE_SCORE + ply as i32);
-        beta = beta.min(MATE_SCORE - (ply as i32 + 1));
-        if alpha >= beta {
-            return alpha;
+        // Step 3. Mate distance pruning
+        if !root_node {
+            alpha = alpha.max(-MATE_SCORE + ply as i32);
+            beta  = beta.min(MATE_SCORE - ply as i32 - 1);
+            if alpha >= beta {
+                return alpha;
+            }
         }
+
+        // Initialise ss[ply] for this node
+        ss[ply].cutoff_cnt = 0;
+        if ply + 2 < MAX_PLY { ss[ply + 2].cutoff_cnt = 0; }
 
         let orig_alpha = alpha;
-        let pv_node = beta - alpha > 1;
-        let mut tt_move = None;
-        let mut tt_score = 0;
-        let mut tt_depth = 0;
+        let excluded_move = ss[ply].excluded_move;
+
+        // ------------------------------------------------------------------
+        // Step 4. TT Probe
+        // ------------------------------------------------------------------
+        let mut tt_move: Option<Move> = None;
+        let mut tt_score = 0i32;
+        let mut tt_depth = 0u8;
         let mut tt_node_type = NodeType::None;
+        let mut tt_hit = false;
 
-        // TT Probe
-        if let Some(entry) = self.tt.probe(board.zobrist_key) {
-            tt_move = Some(entry.best_move);
-            tt_score = entry.score;
-            tt_depth = entry.depth;
-            tt_node_type = entry.node_type;
-
-            if entry.depth >= depth {
-                if entry.node_type == NodeType::Exact {
-                    return entry.score; // PV nodes CAN be cut objectively if Exact
-                }
-                if !pv_node {
-                    if entry.node_type == NodeType::Alpha && entry.score <= alpha {
-                        return alpha;
-                    }
-                    if entry.node_type == NodeType::Beta && entry.score >= beta {
-                        return beta;
-                    }
-                }
-            }
-
-            // Small ProbCut (TT-based)
-            if !pv_node && entry.depth < depth && entry.depth >= depth.saturating_sub(4) {
-                if (entry.node_type == NodeType::Beta || entry.node_type == NodeType::Exact)
-                    && entry.score >= beta + 418 {
-                        return beta;
-                    }
+        if excluded_move.is_none() {
+            if let Some(entry) = self.tt.probe(board.zobrist_key) {
+                tt_move = Some(entry.best_move);
+                tt_score = entry.score;
+                tt_depth = entry.depth;
+                tt_node_type = entry.node_type;
+                tt_hit = true;
             }
         }
 
+        // ttPv: this node is on a known PV path
+        let tt_is_pv = tt_hit && matches!(tt_node_type, NodeType::Exact);
+        ss[ply].tt_pv = pv_node || tt_is_pv;
+
+        // TT cutoff
+        if !pv_node && excluded_move.is_none() && tt_hit && tt_depth >= depth {
+            match tt_node_type {
+                NodeType::Exact => return tt_score,
+                NodeType::Alpha if tt_score <= alpha => return alpha,
+                NodeType::Beta  if tt_score >= beta  => return beta,
+                _ => {}
+            }
+        }
+
+        // Depth-0: drop into qsearch
         if depth == 0 {
-            return self.quiescence(board, alpha, beta, 0);
+            return self.quiescence(board, ss, ply, alpha, beta);
         }
 
+        // ------------------------------------------------------------------
+        // Step 6. Static evaluation
+        // ------------------------------------------------------------------
         let side = board.side_to_move;
-        let king_sq_opt = board.piece_bb(PieceType::King) & board.color_occupancy(side);
-        let in_check = if king_sq_opt.is_not_empty() {
-            let king_sq = Square::new(king_sq_opt.lsb());
-            board.is_square_attacked(king_sq, side.flip())
-        } else {
-            false
-        };
+        let king_bb = board.piece_bb(PieceType::King) & board.color_occupancy(side);
+        let in_check = if king_bb.is_not_empty() {
+            let ksq = Square::new(king_bb.lsb());
+            board.is_square_attacked(ksq, side.flip())
+        } else { false };
+
+        ss[ply].in_check = in_check;
 
         // Check Extension
-        if in_check {
-            depth += 1;
-        }
+        if in_check { depth += 1; }
 
-        // Static evaluation
-        let mut eval = if in_check {
-            -INF // Don't trust static eval when in check
-        } else {
-            board.nnue.evaluate(side, &board.accumulator)
+        let correction_value = {
+            let mat_hash = board.non_pawn_material(side) as usize;
+            self.heuristics.get_non_pawn_correction(side, mat_hash)
         };
 
-        if !in_check && total_pieces <= 12 && eval > 120 {
-            pressure = ((eval as f32 - 120.0) / 200.0).clamp(0.0, 1.0);
-            eval += ((32 - total_pieces) as f32 * pressure * 10.0) as i32;
+        let eval = if in_check {
+            ss[ply].static_eval = SearchStack::NONE_EVAL;
+            -INF
+        } else if tt_hit {
+            let raw = board.nnue.evaluate(side, &board.accumulator);
+            let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
+            ss[ply].static_eval = corrected;
+            // Use tt_score as better eval if bound agrees
+            if (tt_node_type == NodeType::Beta  && tt_score > corrected)
+            || (tt_node_type == NodeType::Alpha && tt_score < corrected) {
+                tt_score
+            } else { corrected }
+        } else {
+            let raw = board.nnue.evaluate(side, &board.accumulator);
+            let corrected = (raw + correction_value / 131072).clamp(-MATE_SCORE + 1, MATE_SCORE - 1);
+            ss[ply].static_eval = corrected;
+            corrected
+        };
+
+        // Improving: static eval better than 2 plies ago
+        let improving = !in_check && ply >= 2
+            && ss[ply].static_eval != SearchStack::NONE_EVAL
+            && ss[ply - 2].static_eval != SearchStack::NONE_EVAL
+            && ss[ply].static_eval > ss[ply - 2].static_eval;
+
+        // Opponent worsening: our eval better than opponent's last eval
+        let opp_worsening = !in_check && ply >= 1
+            && ss[ply].static_eval != SearchStack::NONE_EVAL
+            && ss[ply - 1].static_eval != SearchStack::NONE_EVAL
+            && ss[ply].static_eval > -ss[ply - 1].static_eval;
+
+        // Step 6b. Hindsight reduction adjustment
+        let prior_reduction = if ply > 0 { ss[ply - 1].reduction } else { 0 };
+        if prior_reduction >= 3 && !opp_worsening { depth = depth.saturating_add(1); }
+        if prior_reduction >= 2 && depth >= 2 && !in_check && ply >= 1
+            && ss[ply].static_eval != SearchStack::NONE_EVAL
+            && ss[ply - 1].static_eval != SearchStack::NONE_EVAL
+            && ss[ply].static_eval + ss[ply - 1].static_eval > 173
+        {
+            depth = depth.saturating_sub(1);
         }
 
-        // --- Calculate Correction Value ---
-        let mut correction_value = 0;
-        let mat_hash = board.non_pawn_material(side) as usize;
-        correction_value += self.heuristics.get_non_pawn_correction(side, mat_hash);
-
-        if let Some(pm) = prev_move {
-            if let Some(_prev_piece) = board.piece_on_sq[pm.to_sq() as usize] {
-                // If there's a previous move, add its continuation correction (using a dummy attacker_pt for now, typically it's context-dependent, but we use King as a placeholder for the generic state if not specifically attached to a piece yet. In true Stockfish this is per-piece, but we adjust the *board sum* here).
-                // Wait, continuation history is mostly used for move ordering score!
-                // For static eval correction, Stockfish uses exactly the pieces from the last 2 plies.
-                // We will just use the non-pawn correction for the static eval baseline here.
-            }
-        }
-
-        if !in_check && eval.abs() < 4000 {
-            // Don't adjust mates/winning evals too wildly
-            eval += correction_value;
-        }
-
-        let has_non_pawn_material = (board.colors[side as usize]
+        let has_non_pawn = (board.colors[side as usize]
             & !(board.pieces[PieceType::Pawn as usize] | board.pieces[PieceType::King as usize]))
             .is_not_empty();
 
         // ------------------------------------------------------------------
-        //   PRE-MOVES PRUNING
+        //   PRE-MOVES PRUNING (skip if in check)
         // ------------------------------------------------------------------
+        if !in_check && excluded_move.is_none() {
 
-        // 1. Static Null Move Pruning (Reverse Futility Pruning)
-        if !pv_node && !in_check && depth <= 6 {
-            let margin = 100 + (depth as i32) * 50;
-            if eval - margin >= beta {
-                return eval;
+            // Step 7. Razoring — Stockfish formula
+            if !pv_node && eval < alpha - 485 - 281 * (depth as i32) * (depth as i32) {
+                return self.quiescence(board, ss, ply, alpha, beta);
             }
-        }
 
-        // 5. Razoring
-        if !pv_node && !in_check && depth == 1 {
-            let margin = 200;
-            if eval + margin < alpha {
-                let q_score = self.quiescence(board, alpha, beta, 0);
-                if q_score <= alpha {
-                    return q_score;
+            // Step 8. Futility pruning (Reverse Null Move / static NMP)
+            {
+                let futility_mult = 76 - 23 * if tt_hit { 0 } else { 1 };
+                let fu_margin = futility_mult * depth as i32
+                    - (2474 * improving as i32 + 331 * opp_worsening as i32)
+                        * futility_mult / 1024
+                    + correction_value.abs() / 174665;
+                if !ss[ply].tt_pv && (depth as i32) < 14
+                    && eval - fu_margin >= beta
+                    && eval >= beta
+                    && eval < MATE_SCORE - 100
+                    && beta > -MATE_SCORE + 100
+                {
+                    return (2 * beta + eval) / 3;
                 }
             }
-        }
 
-        // Null Move Pruning
-        if cut_node && !in_check && depth >= 3 && has_non_pawn_material && eval >= beta && total_pieces > 5 {
-            let undo = board.make_null_move();
-            let r = 3;
-            let null_depth = depth.saturating_sub(r);
-            let null_score =
-                -self.alpha_beta(board, null_depth, -beta, -beta + 1, ply + 1, None, !pv_node);
-            board.unmake_null_move(&undo);
+            // Step 9. Null Move Pruning
+            if cut_node && eval >= beta - 18 * depth as i32 + 350
+                && has_non_pawn && ply >= self.nmp_min_ply
+                && beta > -MATE_SCORE + 100
+            {
+                let r = 7 + depth as usize / 3;
+                let null_depth = depth.saturating_sub(r as u8);
 
-            if self.stop.load(Ordering::Relaxed) {
-                return 0;
-            }
+                ss[ply].current_move = None;
+                let undo = board.make_null_move();
+                let null_score = -self.alpha_beta(
+                    board, ss, ply + 1, null_depth, -beta, -beta + 1, false,
+                );
+                board.unmake_null_move(&undo);
 
-            if null_score >= beta {
-                if depth >= 8 && ply < depth as usize {
-                    let verify_score =
-                        self.alpha_beta(board, null_depth, alpha, beta, ply + 1, None, false);
-                    if verify_score >= beta {
-                        return beta;
+                if self.stop.load(Ordering::Relaxed) { return 0; }
+
+                if null_score >= beta && null_score < MATE_SCORE - 100 {
+                    if self.nmp_min_ply > 0 || (depth as usize) < 16 {
+                        return null_score;
                     }
-                } else {
-                    return beta;
+                    // Verification search at high depth
+                    self.nmp_min_ply = ply + 3 * (depth as usize - r as usize) / 4;
+                    let v = self.alpha_beta(board, ss, ply, depth.saturating_sub(r as u8),
+                        beta - 1, beta, false);
+                    self.nmp_min_ply = 0;
+                    if v >= beta { return null_score; }
+                }
+            }
+
+            // Step 10. IIR — simply reduce depth, no recursive call
+            let all_node = !pv_node && !cut_node;
+            if !all_node && depth >= 6 && tt_move.is_none() && prior_reduction <= 3 {
+                depth = depth.saturating_sub(1);
+            }
+
+            // Step 11. Full ProbCut
+            let prob_cut_beta = beta + 235 - 63 * improving as i32;
+            if depth >= 3
+                && beta.abs() < MATE_SCORE - 100
+                && !(tt_hit && tt_depth >= depth.saturating_sub(4) && tt_score < prob_cut_beta)
+            {
+                // Only try captures with SEE >= probCutBeta - staticEval
+                let mut pc_picker = MovePicker::new(tt_move, ply, None, true, in_check, self.thread_id, None);
+                while let Some(pc_move) = pc_picker.next(&self.heuristics, board) {
+                    if !pc_move.is_capture() { continue; }
+                    if Some(pc_move) == excluded_move { continue; }
+                    if !board.see_ge(pc_move, prob_cut_beta - eval) { continue; }
+                    if !board.is_castling_legal(pc_move) { continue; }
+
+                    let pc_undo = board.make_move(pc_move);
+                    let move_side = board.side_to_move.flip();
+                    let mk = board.piece_bb(PieceType::King) & board.color_occupancy(move_side);
+                    let legal = if mk.is_not_empty() {
+                        !board.is_square_attacked(Square::new(mk.lsb()), board.side_to_move)
+                    } else { true };
+
+                    if legal {
+                        ss[ply].current_move = Some(pc_move);
+                        let mut pc_val = -self.quiescence(board, ss, ply + 1, -prob_cut_beta, -prob_cut_beta + 1);
+
+                        if pc_val >= prob_cut_beta {
+                            let pc_depth = depth.saturating_sub(5);
+                            if pc_depth > 0 {
+                                pc_val = -self.alpha_beta(board, ss, ply + 1, pc_depth,
+                                    -prob_cut_beta, -prob_cut_beta + 1, !cut_node);
+                            }
+                        }
+                        board.unmake_move(pc_move, &pc_undo);
+
+                        if pc_val >= prob_cut_beta {
+                            self.tt.store(board.zobrist_key, depth.saturating_sub(4), pc_val,
+                                NodeType::Beta, pc_move, pv_node);
+                            if pc_val < MATE_SCORE - 100 {
+                                return pc_val - (prob_cut_beta - beta);
+                            }
+                        }
+                    } else {
+                        board.unmake_move(pc_move, &pc_undo);
+                    }
                 }
             }
         }
 
-        // 4. Internal Iterative Deepening (IID)
-        // If no TT move at high depth, do a reduced search to find one
-        if tt_move.is_none() && depth >= 6 && !in_check {
-            let _ = self.alpha_beta(board, depth - 2, alpha, beta, ply, prev_move, cut_node);
-            if let Some(entry) = self.tt.probe(board.zobrist_key) {
-                tt_move = Some(entry.best_move);
+        // Step 12. Small TT-based ProbCut (after moves_loop label in Stockfish)
+        {
+            let prob_cut_beta2 = beta + 418;
+            if tt_hit && tt_depth >= depth.saturating_sub(4)
+                && tt_score >= prob_cut_beta2
+                && matches!(tt_node_type, NodeType::Beta)
+                && beta.abs() < MATE_SCORE - 100
+                && tt_score.abs() < MATE_SCORE - 100
+            {
+                return prob_cut_beta2;
             }
         }
+
         let is_shuffling = board.halfmove_clock >= 20;
 
         // ------------------------------------------------------------------
-        //   MOVE GENERATION & ORDERING
+        //   MOVE LOOP SETUP
         // ------------------------------------------------------------------
-        let futility_pruning = !pv_node && !in_check && depth <= 6;
-        let mut futility_margin = 75 + depth as i32 * 150;
-
-        // --- Stockfish Technique: Futility w/ correction history ---
-        futility_margin += correction_value.abs() / 150;
+        let prev_move = if ply > 0 { ss[ply - 1].current_move } else { None };
 
         let countermove = if let Some(pm) = prev_move {
             if let Some(prev_piece) = board.piece_on_sq[pm.to_sq() as usize] {
-                let cm = self
-                    .heuristics
-                    .get_countermove(prev_piece.piece_type(), Square::new(pm.to_sq()));
-                if cm.0 != 0 {
-                    Some(cm)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                let cm = self.heuristics.get_countermove(
+                    prev_piece.piece_type(), Square::new(pm.to_sq()));
+                if cm.0 != 0 { Some(cm) } else { None }
+            } else { None }
+        } else { None };
 
         let global_pv = if ply == 0 {
             let pv_val = self.smp.get_best_move();
             if pv_val != 0 { Some(Move(pv_val)) } else { None }
-        } else {
-            None
-        };
+        } else { None };
+
         let mut picker = MovePicker::new(tt_move, ply, countermove, false, in_check, self.thread_id, global_pv);
 
-        let mut legal_moves = 0;
+        let mut legal_moves = 0usize;
         let mut best_m = Move::new(0, 0, 0);
         let mut best_score = -INF;
-
-        // Track quiet moves searched for history penalty and LMR boost
         let mut quiets_searched: [Move; 64] = [Move::new(0, 0, 0); 64];
-        let mut quiet_count = 0;
+        let mut quiet_count = 0usize;
         let mut first_move = true;
+        let mut cur_depth = depth; // depth may change in loop via alpha-improvement reduction
 
         while let Some(m) = picker.next(&self.heuristics, board) {
+            if Some(m) == excluded_move { continue; }
+
             let start_nodes = self.nodes;
             let is_capture = m.is_capture();
             let is_promo = m.is_promotion();
 
+            let attacker_pt = board.piece_on_sq[m.from_sq() as usize]
+                .map(|p| p.piece_type())
+                .unwrap_or(PieceType::Pawn);
+
+            // --- Pre-make-move pruning (Stockfish Step 14) ---
+            if !root_node && has_non_pawn && best_score > -MATE_SCORE + 100 {
+                // LMP
+                let lmp_threshold = (3 + cur_depth as usize * cur_depth as usize) / (2 - improving as usize);
+                if legal_moves >= lmp_threshold { picker.skip_quiets(); }
+
+                // Compute LMR depth for pruning checks
+                let lmr_d = (cur_depth as i32 - 1).max(0)
+                    - (self.reductions.get(legal_moves.min(63)).copied().unwrap_or(0) / 1024);
+                let lmr_depth = lmr_d.max(0);
+
+                if is_capture || (is_promo && !is_capture) {
+                    // Capture futility pruning (Stockfish formula)
+                    let victim_pt = if m.flag() == Move::FLAG_EP { PieceType::Pawn }
+                        else { board.piece_on_sq[m.to_sq() as usize]
+                            .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn) };
+                    let capt_hist = self.heuristics.get_capture_history(
+                        attacker_pt, Square::new(m.to_sq()), victim_pt);
+                    if lmr_depth < 7 {
+                        let fv = eval + 232 + 217 * lmr_depth
+                            + crate::eval::PIECE_VALUES[victim_pt as usize]
+                            + 131 * capt_hist / 1024;
+                        if fv <= alpha { continue; }
+                    }
+                    // SEE pruning captures
+                    let margin = (166 * cur_depth as i32 + capt_hist / 29).max(0);
+                    if !board.see_ge(m, -margin) { continue; }
+                } else {
+                    // Continuation history pruning for quiets
+                    let cont_hist = if let Some(pm) = prev_move {
+                        if let Some(pp) = board.piece_on_sq[pm.to_sq() as usize] {
+                            self.heuristics.get_continuation(
+                                pp.piece_type(), Square::new(pm.to_sq()),
+                                attacker_pt, Square::new(m.to_sq()))
+                        } else { 0 }
+                    } else { 0 };
+                    if cont_hist < -4083 * cur_depth as i32 { continue; }
+
+                    let history_score = self.heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
+                    let lmr_adj = lmr_depth + (history_score + 69 * cont_hist / 32 + cont_hist) / 3208;
+                    // Quiet futility pruning
+                    let fv = eval + 42 + 161 * (best_m.0 == 0) as i32
+                        + 127 * lmr_adj + 85 * (eval > alpha) as i32;
+                    if !in_check && lmr_adj < 13 && fv <= alpha {
+                        if best_score <= fv && best_score < MATE_SCORE - 100 { best_score = fv; }
+                        continue;
+                    }
+                    // SEE for quiets
+                    if !board.see_ge(m, -25 * lmr_adj * lmr_adj) { continue; }
+                }
+            }
+
+            if !board.is_castling_legal(m) { continue; }
+
+            let undo = board.make_move(m);
+            if board.zobrist_key != board.compute_hash() {
+                eprintln!("HASH DRIFT AFTER MAKE_MOVE! ply={}", ply);
+                std::process::exit(1);
+            }
+
+            let move_side = board.side_to_move.flip();
+            let mk = board.piece_bb(PieceType::King) & board.color_occupancy(move_side);
+            let move_is_legal = if mk.is_not_empty() {
+                !board.is_square_attacked(Square::new(mk.lsb()), board.side_to_move)
+            } else { true };
+
+            if !move_is_legal {
+                board.unmake_move(m, &undo);
+                continue;
+            }
+
+            legal_moves += 1;
+            ss[ply].current_move = Some(m);
+            ss[ply].move_count = legal_moves;
+
+            let gives_check = {
+                let opp = board.side_to_move;
+                let opp_kb = board.piece_bb(PieceType::King) & board.color_occupancy(opp);
+                opp_kb.is_not_empty()
+                    && board.is_square_attacked(Square::new(opp_kb.lsb()), opp.flip())
+            };
+
+            // ------------------------------------------------------------------
+            // Step 15. Singular Extension (Stockfish)
+            // ------------------------------------------------------------------
+            let mut extension: i32 = 0;
+            if !root_node && !is_shuffling {
+                if let Some(ttm) = tt_move {
+                    if m.0 == ttm.0
+                        && excluded_move.is_none()
+                        && cur_depth >= 6 + ss[ply].tt_pv as u8
+                        && tt_score.abs() < MATE_SCORE - 100
+                        && tt_depth >= cur_depth.saturating_sub(3)
+                        && matches!(tt_node_type, NodeType::Beta)
+                    {
+                        let sing_beta = tt_score - (53 + 75 * (ss[ply].tt_pv && !pv_node) as i32)
+                            * cur_depth as i32 / 60;
+                        let sing_depth = (cur_depth - 1) / 2;
+
+                        board.unmake_move(m, &undo);
+                        ss[ply].excluded_move = Some(m);
+                        let se_score = self.alpha_beta(
+                            board, ss, ply, sing_depth, sing_beta - 1, sing_beta, cut_node);
+                        ss[ply].excluded_move = None;
+                        let undo2 = board.make_move(m);
+
+                        if se_score < sing_beta {
+                            // Singular: compute double/triple extension margins
+                            let corr_adj = correction_value.abs() / 230673;
+                            let double_margin = -4 + 199 * pv_node as i32
+                                - 201 * !tt_move.map(|t| board.piece_on_sq[t.to_sq() as usize].is_some()).unwrap_or(false) as i32
+                                - corr_adj;
+                            let triple_margin = 73 + 302 * pv_node as i32 - 248 + 90 * ss[ply].tt_pv as i32 - corr_adj;
+
+                            extension = 1
+                                + (se_score < sing_beta - double_margin) as i32
+                                + (se_score < sing_beta - triple_margin) as i32;
+                            cur_depth += 1; // Stockfish increments depth when singular
+                        } else if se_score >= beta && se_score < MATE_SCORE - 100 {
+                            // Multi-cut: update ttMoveHistory and prune
+                            self.heuristics.update_tt_move_history((-400 - 100 * cur_depth as i32).max(-4000));
+                            board.unmake_move(m, &undo2);
+                            return se_score;
+                        } else if tt_score >= beta {
+                            extension = -3;
+                        } else if cut_node {
+                            extension = -2;
+                        }
+                    }
+                }
+
+                // Promotion extension
+                if is_promo { extension = extension.max(1); }
+            }
+
+            let new_depth = (cur_depth as i32 - 1 + extension).max(0) as u8;
+
+            // Stat score for LMR
+            let stat_score = if is_capture {
+                let victim_pt = board.piece_on_sq[m.to_sq() as usize]
+                    .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);
+                868 * crate::eval::PIECE_VALUES[victim_pt as usize] / 128
+                    + self.heuristics.get_capture_history(attacker_pt, Square::new(m.to_sq()), victim_pt)
+            } else {
+                let mut ss_val = 2 * self.heuristics.get_history(side, attacker_pt, Square::new(m.to_sq()));
+                if let Some(pm) = prev_move {
+                    if let Some(pp) = board.piece_on_sq[pm.to_sq() as usize] {
+                        ss_val += self.heuristics.get_continuation(
+                            pp.piece_type(), Square::new(pm.to_sq()),
+                            attacker_pt, Square::new(m.to_sq()));
+                    }
+                }
+                ss_val
+            };
+            ss[ply].stat_score = stat_score;
+
+            // ------------------------------------------------------------------
+            // Step 17. Late Move Reductions (Stockfish)
+            // ------------------------------------------------------------------
+            let mut score = 0i32;
+            let mut needs_full = true;
+
+            if cur_depth >= 2 && legal_moves > 1 {
+                // Build r in 1024ths (Stockfish uses /1024 scaled ints)
+                let move_idx = legal_moves.min(63);
+                let depth_idx = cur_depth.min(63) as usize;
+                let mut r = self.reductions[move_idx] + self.reductions[depth_idx];
+
+                // ttPv adjustments
+                if ss[ply].tt_pv {
+                    r += 946;
+                    r -= 2719
+                        + pv_node as i32 * 983
+                        + (tt_score > alpha) as i32 * 922
+                        + (tt_depth >= cur_depth) as i32 * (934 + cut_node as i32 * 1011);
+                }
+
+                r += 714; // base offset
+                r -= (legal_moves as i32).min(63) * 73;
+                r -= correction_value.abs() / 30370;
+
+                if cut_node { r += 3372 + 997 * tt_move.is_none() as i32; }
+                let tt_capture = tt_move.map(|t| t.is_capture()).unwrap_or(false);
+                if tt_capture { r += 1119; }
+
+                // cutoffCnt boost
+                if ply + 1 < MAX_PLY && ss[ply + 1].cutoff_cnt > 1 {
+                    let all_node = !pv_node && !cut_node;
+                    r += 256 + 1024 * (ss[ply + 1].cutoff_cnt > 2) as i32 + 1024 * all_node as i32;
+                }
+
+                // TT move gets reduced less
+                if Some(m) == tt_move { r -= 2151; }
+
+                // History bonus/penalty
+                r -= stat_score * 850 / 8192;
+
+                // Compute reduced depth d (clamped to [1, new_depth+2])
+                let d = (new_depth as i32 - r / 1024).clamp(1, new_depth as i32 + 2) as u8 + pv_node as u8;
+                ss[ply].reduction = new_depth as i32 - d as i32;
+
+                score = -self.alpha_beta(board, ss, ply + 1, d, -(alpha + 1), -alpha, true);
+                ss[ply].reduction = 0;
+
+                if score > alpha {
+                    // Stockfish post-LMR: doDeeperSearch / doShallowerSearch
+                    let deeper = (d < new_depth) && score > best_score + 50;
+                    let shallower = score < best_score + 9;
+                    let adj_depth = (new_depth as i32 + deeper as i32 - shallower as i32).max(0) as u8;
+
+                    if adj_depth > d {
+                        // Post-LMR continuation bonus
+                        if let Some(pm) = prev_move {
+                            if let Some(pp) = board.piece_on_sq[pm.to_sq() as usize] {
+                                self.heuristics.update_continuation(
+                                    pp.piece_type(), Square::new(pm.to_sq()),
+                                    attacker_pt, Square::new(m.to_sq()), cur_depth);
+                            }
+                        }
+                        score = -self.alpha_beta(board, ss, ply + 1, adj_depth, -(alpha + 1), -alpha, !cut_node);
+                    }
+                    needs_full = score > alpha;
+                } else {
+                    needs_full = false;
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Step 18. Full-depth PVS search
+            // ------------------------------------------------------------------
+            if needs_full {
+                if legal_moves == 1 {
+                    score = -self.alpha_beta(board, ss, ply + 1, new_depth, -beta, -alpha, false);
+                } else {
+                    score = -self.alpha_beta(board, ss, ply + 1, new_depth, -(alpha+1), -alpha, !cut_node);
+                    if score > alpha && score < beta {
+                        score = -self.alpha_beta(board, ss, ply + 1, new_depth, -beta, -alpha, false);
+                    }
+                }
+            }
+
+            if ply == 0 && first_move {
+                self.best_move_nodes += self.nodes - start_nodes;
+            }
+            first_move = false;
+
+            board.unmake_move(m, &undo);
+            if board.zobrist_key != board.compute_hash() {
+                eprintln!("HASH DRIFT AFTER UNMAKE! ply={}", ply);
+                std::process::exit(1);
+            }
+
+            if self.stop.load(Ordering::Relaxed) { return 0; }
+
+            if score > best_score { best_score = score; }
+
+            if score >= beta {
+                // cutoffCnt
+                ss[ply].cutoff_cnt += (extension < 2) as i32 + pv_node as i32;
+
+                // Update heuristics on beta cutoff
+                if !is_capture {
+                    let see_ok = board.see_ge(m, 0);
+                    if see_ok {
+                        self.heuristics.update_history(side, attacker_pt, Square::new(m.to_sq()), cur_depth);
+                        if attacker_pt == PieceType::Pawn {
+                            self.heuristics.update_pawn_history(side, Square::new(m.from_sq()), Square::new(m.to_sq()), cur_depth);
+                        } else if attacker_pt == PieceType::Knight || attacker_pt == PieceType::Bishop {
+                            self.heuristics.update_minor_piece_history(side, Square::new(m.from_sq()), Square::new(m.to_sq()), cur_depth);
+                        }
+                        self.heuristics.update_low_ply_history(m, ply, cur_depth);
+                    } else {
+                        self.heuristics.penalize_history(side, attacker_pt, Square::new(m.to_sq()), cur_depth);
+                    }
+                    self.heuristics.update_killer(m, ply);
+
+                    if let Some(pm) = prev_move {
+                        if let Some(pp) = board.piece_on_sq[pm.to_sq() as usize] {
+                            self.heuristics.update_countermove(pp.piece_type(), Square::new(pm.to_sq()), m);
+                            if see_ok {
+                                self.heuristics.update_continuation(
+                                    pp.piece_type(), Square::new(pm.to_sq()),
+                                    attacker_pt, Square::new(m.to_sq()), cur_depth);
+                            }
+                        }
+                    }
+
+                    // Penalize all quiets that failed before this cutoff
+                    for i in 0..quiet_count.min(64) {
+                        let qm = quiets_searched[i];
+                        if qm.0 == m.0 { continue; }
+                        let qpt = board.piece_on_sq[qm.from_sq() as usize]
+                            .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);
+                        let penalty = cur_depth as i32 * cur_depth as i32;
+                        let entry = &mut self.heuristics.history[side as usize][qpt as usize][qm.to_sq() as usize];
+                        *entry -= penalty - *entry * penalty.abs() / 16384;
+                        self.heuristics.penalize_low_ply_history(qm, ply, cur_depth);
+                    }
+                } else {
+                    let victim_pt = board.piece_on_sq[m.to_sq() as usize]
+                        .map(|p| p.piece_type()).unwrap_or(PieceType::Pawn);
+                    self.heuristics.update_capture_history(attacker_pt, Square::new(m.to_sq()), victim_pt, cur_depth);
+                }
+
+                // Fail-high score softening + TT store
+                let ret_score = if best_score < MATE_SCORE - MAX_PLY as i32 {
+                    (best_score * cur_depth as i32 + beta) / (cur_depth as i32 + 1)
+                } else { best_score };
+
+                self.tt.store(board.zobrist_key, cur_depth, ret_score, NodeType::Beta, m, pv_node);
+                // ttMoveHistory update (Stockfish)
+                self.heuristics.update_tt_move_history(if Some(m) == tt_move { 809 } else { -865 });
+                return ret_score;
+            }
+
+            if score > alpha {
+                alpha = score;
+                best_m = m;
+                if ply == 0 {
+                    self.best_move = m;
+                    self.smp.set_best_move(m);
+                }
+                // Update PV
+                self.pv_table[ply][ply] = m;
+                if ply + 1 < MAX_PLY {
+                    for j in (ply + 1)..self.pv_length[ply + 1] {
+                        self.pv_table[ply][j] = self.pv_table[ply + 1][j];
+                    }
+                    self.pv_length[ply] = self.pv_length[ply + 1];
+                }
+
+                // Depth reduction on alpha improvement (Stockfish Step 20)
+                if cur_depth > 2 && cur_depth < 14 && best_score.abs() < MATE_SCORE - 100 {
+                    cur_depth = cur_depth.saturating_sub(2);
+                }
+            }
+
+            // Track quiet moves
             if !is_capture && !is_promo && quiet_count < 64 {
                 quiets_searched[quiet_count] = m;
                 quiet_count += 1;
             }
 
-            // Store attacker piece type BEFORE make_move (from_sq will be empty after)
-            let attacker_pt = board.piece_on_sq[m.from_sq() as usize]
-                .map(|p| p.piece_type())
-                .unwrap_or(PieceType::Pawn);
-
-            // SEE pruning for quiet moves BEFORE make_move (Stockfish style)
-            if depth <= 4 && !is_capture && !is_promo && legal_moves > 0
-                && !board.see_ge(m, -(depth as i32 * 80)) {
-                    continue;
-                }
-
-            // SEE pruning for captures w/ captHist
-            if depth <= 6 && is_capture && !is_promo && legal_moves > 0 {
-                let victim_pt = if m.flag() == Move::FLAG_EP {
-                    PieceType::Pawn
-                } else {
-                    board.piece_on_sq[m.to_sq() as usize]
-                        .map(|p| p.piece_type())
-                        .unwrap_or(PieceType::Pawn)
-                };
-                let capt_hist = self.heuristics.get_capture_history(
-                    attacker_pt,
-                    Square::new(m.to_sq()),
-                    victim_pt,
-                );
-                let margin = (166 * depth as i32 + capt_hist / 29).max(0);
-                if !board.see_ge(m, -margin) {
-                    continue;
-                }
-            }
-
-            if !board.is_castling_legal(m) {
-                continue;
-            }
-
-            let undo = board.make_move(m);
-            if board.zobrist_key != board.compute_hash() {
-                eprintln!(
-                    "HASH DRIFT AFTER MAKE_MOVE {:?}! incrementally={:x}, true={:x}, ply={}",
-                    m,
-                    board.zobrist_key,
-                    board.compute_hash(),
-                    ply
-                );
-                std::process::exit(1);
-            }
-
-            let move_side = board.side_to_move.flip();
-            let move_king_bb = board.piece_bb(PieceType::King) & board.color_occupancy(move_side);
-            let move_is_legal = if move_king_bb.is_not_empty() {
-                let king_sq = Square::new(move_king_bb.lsb());
-                !board.is_square_attacked(king_sq, board.side_to_move)
-            } else {
-                true
-            };
-
-            if move_is_legal {
-                legal_moves += 1;
-                let mut score = 0;
-
-                // --- Singular Extension ---
-                let mut extension: i32 = 0;
-                if !is_shuffling {
-                    if let Some(ttm) = tt_move {
-                        if m.0 == ttm.0
-                            && depth >= 7
-                            && !is_promo
-                            && tt_depth >= depth - 3
-                            && (tt_node_type == NodeType::Beta || tt_node_type == NodeType::Exact)
-                        {
-                            let singular_margin = depth as i32 * 2;
-                            let se_beta = (tt_score - singular_margin).max(-MATE_SCORE);
-                            let se_depth = (depth - 1) / 2;
-
-                            board.unmake_move(m, &undo);
-                            let se_score = self.alpha_beta(
-                                board,
-                                se_depth,
-                                se_beta - 1,
-                                se_beta,
-                                ply,
-                                prev_move,
-                                cut_node,
-                            );
-                            let _undo_re = board.make_move(m);
-
-                            if se_score < se_beta {
-                                extension = 1;
-                            } else if se_beta >= beta {
-                                // Multi-cut pruning
-                                board.unmake_move(m, &_undo_re);
-                                return beta;
-                            } else if !cut_node {
-                                extension = -1; // Negative singular extension
-                            }
-                        }
-                    }
-                }
-
-                // Check if THIS move gives check
-                let gives_check = {
-                    let opp = board.side_to_move;
-                    let opp_king_bb = board.piece_bb(PieceType::King) & board.color_occupancy(opp);
-                    if opp_king_bb.is_not_empty() {
-                        let opp_king_sq = Square::new(opp_king_bb.lsb());
-                        board.is_square_attacked(opp_king_sq, opp.flip())
-                    } else {
-                        false
-                    }
-                };
-
-                // Passed pawn extension (attacker_pt was stored before make_move)
-                if attacker_pt == PieceType::Pawn && !is_capture {
-                    let rank = m.to_sq() / 8;
-                    if (side == crate::types::Color::White && rank >= 6)
-                        || (side == crate::types::Color::Black && rank <= 1)
-                    {
-                        extension = extension.max(1);
-                        if pressure > 0.5 {
-                            extension += 1;
-                        }
-                    }
-                }
-
-                if is_promo {
-                    extension = extension.max(1);
-                }
-
-                let mut stat_score = 0;
-                if !is_capture && !is_promo {
-                    stat_score =
-                        self.heuristics
-                            .get_history(side, attacker_pt, Square::new(m.to_sq()));
-                    if attacker_pt == PieceType::Pawn {
-                        stat_score += self.heuristics.get_pawn_history(
-                            side,
-                            Square::new(m.from_sq()),
-                            Square::new(m.to_sq()),
-                        );
-                    } else if attacker_pt == PieceType::Knight || attacker_pt == PieceType::Bishop {
-                        stat_score += self.heuristics.get_minor_piece_history(
-                            side,
-                            Square::new(m.from_sq()),
-                            Square::new(m.to_sq()),
-                        );
-                    }
-                    stat_score += self.heuristics.get_low_ply_history(m, ply);
-
-                    if let Some(pm) = prev_move {
-                        if let Some(prev_piece) = board.piece_on_sq[pm.to_sq() as usize] {
-                            stat_score += self.heuristics.get_continuation(
-                                prev_piece.piece_type(),
-                                Square::new(pm.to_sq()),
-                                attacker_pt,
-                                Square::new(m.to_sq()),
-                            );
-                        }
-                    }
-                }
-
-                // --- Futility Pruning ---
-                if futility_pruning && legal_moves > 1 && !is_capture && !is_promo && !gives_check {
-                    let adjusted_margin = futility_margin + stat_score / 150;
-                    if eval + adjusted_margin <= alpha {
-                        board.unmake_move(m, &undo);
-                        continue;
-                    }
-                }
-
-                // --- Capture Futility Pruning ---
-                if !pv_node && is_capture && !is_promo && !gives_check && depth <= 5 {
-                    let victim_pt = if m.flag() == Move::FLAG_EP {
-                        PieceType::Pawn
-                    } else {
-                        board.piece_on_sq[m.to_sq() as usize]
-                            .map(|p| p.piece_type())
-                            .unwrap_or(PieceType::Pawn)
-                    };
-                    let capt_hist = self.heuristics.get_capture_history(
-                        attacker_pt,
-                        Square::new(m.to_sq()),
-                        victim_pt,
-                    );
-                    let futility_value = eval
-                        + 232
-                        + 217 * (depth as i32)
-                        + crate::eval::PIECE_VALUES[victim_pt as usize] * 10
-                        + capt_hist / 100;
-                    if futility_value <= alpha {
-                        board.unmake_move(m, &undo);
-                        continue;
-                    }
-                }
-
-                // --- SEE Pruning ---
-                // Prune bad captures at low depth, unless they check/promote or are in PV
-                if !pv_node && is_capture && !is_promo && !gives_check && depth <= 3 {
-                    if !board.see_ge(m, 0) {
-                        board.unmake_move(m, &undo);
-                        continue;
-                    }
-                }
-
-                // --- Late Move Pruning (LMP) ---
-                if !pv_node && depth <= 3 && !in_check && !is_capture && !is_promo && !gives_check {
-                    let lmp_threshold = 3 + (depth as usize) * (depth as usize);
-                    if legal_moves > lmp_threshold {
-                        board.unmake_move(m, &undo);
-                        continue;
-                    }
-                }
-
-                // Compute search depth with extension
-                let new_depth = (depth as i32 - 1 + extension).max(0) as u8;
-
-                // --- Late Move Reductions (LMR) ---
-                let mut needs_full_search = true;
-
-                if legal_moves >= 4
-                    && depth >= 3
-                    && !is_capture
-                    && !is_promo
-                    && !in_check
-                    && !gives_check
-                {
-                    // Dynamic LMR Formula
-                    let reduction_f32 = ((depth as f32).ln() * (legal_moves as f32).ln()) / 2.0;
-                    let mut r = reduction_f32 as i32;
-
-                    // Apply smaller reduction in PV nodes
-                    if pv_node {
-                        r -= 1;
-                    }
-
-                    // Adjust by history score vaguely
-                    let h = self
-                        .heuristics
-                        .get_history(side, attacker_pt, Square::new(m.to_sq()));
-                    if h > 4000 {
-                        r -= 1;
-                    } else if h < -2000 {
-                        r += 1;
-                    }
-
-                    r = r.max(0);
-
-                    let reduced_depth = (new_depth as i32 - r).max(1) as u8;
-
-                    score = -self.alpha_beta(
-                        board,
-                        reduced_depth,
-                        -alpha - 1,
-                        -alpha,
-                        ply + 1,
-                        Some(m),
-                        true,
-                    );
-
-                    needs_full_search = score > alpha;
-                }
-
-                // --- Principal Variation Search (PVS) ---
-                if needs_full_search {
-                    if legal_moves == 1 {
-                        score =
-                            -self.alpha_beta(board, new_depth, -beta, -alpha, ply + 1, Some(m), false);
-                    } else {
-                        score = -self.alpha_beta(
-                            board,
-                            new_depth,
-                            -alpha - 1,
-                            -alpha,
-                            ply + 1,
-                            Some(m),
-                            true, // Zero-window searched nodes act as cut nodes
-                        );
-                        if score > alpha && score < beta {
-                            score = -self.alpha_beta(
-                                board,
-                                new_depth,
-                                -beta,
-                                -alpha,
-                                ply + 1,
-                                Some(m),
-                                false,
-                            );
-                        }
-                    }
-
-                    // #24 Post-LMR contHist update
-                    if legal_moves >= 3 && score > alpha && !is_capture && !is_promo {
-                        if let Some(pm) = prev_move {
-                            if let Some(prev_piece) = board.piece_on_sq[pm.to_sq() as usize] {
-                                // Small bonus for move that caused re-search to fail high
-                                self.heuristics.update_continuation(
-                                    prev_piece.piece_type(),
-                                    Square::new(pm.to_sq()),
-                                    attacker_pt,
-                                    Square::new(m.to_sq()),
-                                    depth,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if ply == 0 && first_move {
-                    self.best_move_nodes += self.nodes - start_nodes;
-                }
-                first_move = false;
-
-                board.unmake_move(m, &undo);
-                if board.zobrist_key != board.compute_hash() {
-                    eprintln!("HASH DRIFT AFTER UNMAKE_MOVE {:?} (PVS)! incrementally={:x}, true={:x}, ply={}", m, board.zobrist_key, board.compute_hash(), ply);
-                    std::process::exit(1);
-                }
-
-                if self.stop.load(Ordering::Relaxed) {
-                    return 0;
-                }
-
-                if score > best_score {
-                    best_score = score;
-                }
-
-                if score >= beta {
-                    // Beta cutoff — update heuristics
-                    if !is_capture {
-                        // Negative SEE penalty on quiet history
-                        let see_ok = board.see_ge(m, 0);
-                        if !see_ok {
-                            self.heuristics.penalize_history(
-                                side,
-                                attacker_pt,
-                                Square::new(m.to_sq()),
-                                depth,
-                            );
-                            if attacker_pt == PieceType::Pawn {
-                                self.heuristics.penalize_pawn_history(
-                                    side,
-                                    Square::new(m.from_sq()),
-                                    Square::new(m.to_sq()),
-                                    depth,
-                                );
-                            } else if attacker_pt == PieceType::Knight
-                                || attacker_pt == PieceType::Bishop
-                            {
-                                self.heuristics.penalize_minor_piece_history(
-                                    side,
-                                    Square::new(m.from_sq()),
-                                    Square::new(m.to_sq()),
-                                    depth,
-                                );
-                            }
-                            self.heuristics.penalize_low_ply_history(m, ply, depth);
-                        } else {
-                            // Update quiet histories
-                            self.heuristics.update_history(
-                                side,
-                                attacker_pt,
-                                Square::new(m.to_sq()),
-                                depth,
-                            );
-                            if attacker_pt == PieceType::Pawn {
-                                self.heuristics.update_pawn_history(
-                                    side,
-                                    Square::new(m.from_sq()),
-                                    Square::new(m.to_sq()),
-                                    depth,
-                                );
-                            } else if attacker_pt == PieceType::Knight
-                                || attacker_pt == PieceType::Bishop
-                            {
-                                self.heuristics.update_minor_piece_history(
-                                    side,
-                                    Square::new(m.from_sq()),
-                                    Square::new(m.to_sq()),
-                                    depth,
-                                );
-                            }
-                            self.heuristics.update_low_ply_history(m, ply, depth);
-                        }
-
-                        self.heuristics.update_killer(m, ply);
-
-                        // Continuation history
-                        if let Some(pm) = prev_move {
-                            if let Some(prev_piece) = board.piece_on_sq[pm.to_sq() as usize] {
-                                self.heuristics.update_countermove(
-                                    prev_piece.piece_type(),
-                                    Square::new(pm.to_sq()),
-                                    m,
-                                );
-                                if see_ok {
-                                    self.heuristics.update_continuation(
-                                        prev_piece.piece_type(),
-                                        Square::new(pm.to_sq()),
-                                        attacker_pt,
-                                        Square::new(m.to_sq()),
-                                        depth,
-                                    );
-                                }
-                            }
-                        }
-
-                        // Penalize all quiet moves that failed before cutoff
-                        for qm in quiets_searched.iter().take(quiet_count) {
-                            if qm.0 != m.0 {
-                                if let Some(qp) = board.piece_on_sq[qm.from_sq() as usize] {
-                                    let qpt = qp.piece_type();
-
-                                    // --- Stockfish Technique: Fail-low counter bonus ---
-                                    // Instead of just penalizing based on depth, Stockfish penalizes failed quiets
-                                    // more if their statScore is already high, to aggressively drop them.
-                                    // We will calculate a stat_score penalty.
-                                    let stat_score = self.heuristics.get_history(
-                                        side,
-                                        qpt,
-                                        Square::new(qm.to_sq()),
-                                    );
-                                    let mut penalty = depth as i32 * depth as i32;
-                                    penalty += stat_score / 10; // Extra penalty for high initial score
-
-                                    // Normally penalize_history just uses depth, but here we manually subtract
-                                    let entry = &mut self.heuristics.history[side as usize]
-                                        [qpt as usize]
-                                        [qm.to_sq() as usize];
-                                    *entry -= penalty - *entry * penalty.abs() / 16384;
-                                    // We skip adding this logic manually into pawn_history and minor_piece_history to keep it simple,
-                                    // but we run their standard penalize methods.
-
-                                    if qpt == PieceType::Pawn {
-                                        self.heuristics.penalize_pawn_history(
-                                            side,
-                                            Square::new(qm.from_sq()),
-                                            Square::new(qm.to_sq()),
-                                            depth,
-                                        );
-                                    } else if qpt == PieceType::Knight || qpt == PieceType::Bishop {
-                                        self.heuristics.penalize_minor_piece_history(
-                                            side,
-                                            Square::new(qm.from_sq()),
-                                            Square::new(qm.to_sq()),
-                                            depth,
-                                        );
-                                    }
-                                    self.heuristics.penalize_low_ply_history(*qm, ply, depth);
-                                }
-                            }
-                        }
-                    } else {
-                        // Capture history update
-                        let to_sq = m.to_sq();
-                        let victim_pt = board.piece_on_sq[to_sq as usize]
-                            .map(|p| p.piece_type())
-                            .unwrap_or(PieceType::Pawn);
-                        self.heuristics.update_capture_history(
-                            attacker_pt,
-                            Square::new(to_sq),
-                            victim_pt,
-                            depth,
-                        );
-                    }
-
-                    // Fail-high softening
-                    let mut ret_score = score;
-                    if ret_score < MATE_SCORE - MAX_PLY as i32 {
-                        ret_score = (ret_score * (depth as i32) + beta) / (depth as i32 + 1);
-                    }
-
-                    self.tt.store(
-                        board.zobrist_key,
-                        depth,
-                        ret_score,
-                        NodeType::Beta,
-                        m,
-                        pv_node,
-                    );
-                    return ret_score;
-                }
-
-                if score > alpha {
-                    alpha = score;
-                    best_m = m;
-                    if ply == 0 {
-                        self.best_move = m;
-                        self.smp.set_best_move(m);
-                    }
-
-                    // Update PV
-                    self.pv_table[ply][ply] = m;
-                    if ply + 1 < MAX_PLY {
-                        for j in (ply + 1)..self.pv_length[ply + 1] {
-                            self.pv_table[ply][j] = self.pv_table[ply + 1][j];
-                        }
-                        self.pv_length[ply] = self.pv_length[ply + 1];
-                    }
-                }
-
-                // Track quiet moves searched
-                if !is_capture && !is_promo {
-                    if quiet_count < 64 {
-                        quiets_searched[quiet_count] = m;
-                    }
-                    quiet_count += 1;
-
-                    // skip_quiet_moves (First-Move-Count Pruning)
-                    if !pv_node && !in_check && depth <= 3 && best_score > -MATE_SCORE {
-                        let fmc = if depth == 1 {
-                            2
-                        } else if depth == 2 {
-                            4
-                        } else {
-                            8
-                        };
-                        if quiet_count >= fmc {
-                            picker.skip_quiets();
-                        }
-                    }
-                }
-            } else {
-                board.unmake_move(m, &undo);
-                if board.zobrist_key != board.compute_hash() {
-                    eprintln!("HASH DRIFT AFTER UNMAKE_MOVE {:?} (ILLEGAL)! incrementally={:x}, true={:x}, ply={}", m, board.zobrist_key, board.compute_hash(), ply);
-                    std::process::exit(1);
-                }
+            // skip_quiets (LMP)
+            if !pv_node && !in_check && cur_depth <= 3 && best_score > -MATE_SCORE + 100 {
+                let fmc = if cur_depth == 1 { 2 } else if cur_depth == 2 { 4 } else { 8 };
+                if quiet_count >= fmc { picker.skip_quiets(); }
             }
         }
 
@@ -1008,6 +921,7 @@ impl Search {
         self.start_time = Instant::now();
         self.best_move = Move::new(0, 0, 0);
         self.best_move_nodes = 0;
+        self.nmp_min_ply = 0;
         let mut average_score = 0;
 
         let start_depth = if self.thread_id > 0 {
@@ -1016,26 +930,27 @@ impl Search {
             1
         };
 
+        // Initialize SearchStack: ss[0..MAX_PLY+6]
+        let mut ss = vec![SearchStack::new(); MAX_PLY + 10];
+
         for d in start_depth..=max_depth {
             let nodes_before_iter = self.nodes;
             let score;
 
+            // Reset ss for each iteration
+            for s in ss.iter_mut() { *s = SearchStack::new(); }
+
             // Aspiration Windows from depth 5+
             if d >= 5 {
-                let mut delta: i32 = 30;
+                // Stockfish: delta starts at 5 + abs(avg)*avg/9000, expands by delta/3
+                let avg = average_score as i32;
+                let mut delta: i32 = 5 + avg.abs() * avg.abs() / 9000;
+                delta = delta.max(5);
                 let mut a = (average_score - delta).max(-INF);
                 let mut b = (average_score + delta).min(INF);
-                let mut failed_high_count = 0;
-                let mut search_again_counter = 0;
 
                 loop {
-                    // Adjust depth slightly if we keep failing high (Stockfish style)
-                    let search_depth = if d > 1 {
-                        (d as i32 - failed_high_count - search_again_counter / 2).max(1) as u8
-                    } else {
-                        1
-                    };
-                    let s = self.alpha_beta(board, search_depth, a, b, 0, None, false);
+                    let s = self.alpha_beta(board, &mut ss, 0, d, a, b, false);
 
                     if self.stop.load(Ordering::Relaxed) {
                         return self.best_move;
@@ -1046,39 +961,28 @@ impl Search {
                         if self.thread_id == 0 {
                             self.timer.aspiration_fail(true);
                         }
-                        delta = match delta {
-                            30 => 100,
-                            100 => 300,
-                            _ => INF,
-                        };
+                        b = (a + b) / 2;
                         a = (average_score - delta).max(-INF);
-                        failed_high_count = 0;
-                        search_again_counter += 1;
+                        delta += delta / 3;
                     } else if s >= b {
                         // Fail high
                         if self.thread_id == 0 {
                             self.timer.aspiration_fail(false);
                         }
-                        delta = match delta {
-                            30 => 100,
-                            100 => 300,
-                            _ => INF,
-                        };
                         b = (average_score + delta).min(INF);
-                        failed_high_count += 1;
-                        search_again_counter += 1;
+                        delta += delta / 3;
                     } else {
                         score = s;
                         break;
                     }
 
-                    if delta > 1000 {
-                        score = self.alpha_beta(board, d, -INF, INF, 0, None, false);
+                    if delta > 2000 {
+                        score = self.alpha_beta(board, &mut ss, 0, d, -INF, INF, false);
                         break;
                     }
                 }
             } else {
-                score = self.alpha_beta(board, d, -INF, INF, 0, None, false);
+                score = self.alpha_beta(board, &mut ss, 0, d, -INF, INF, false);
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
