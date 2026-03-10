@@ -16,6 +16,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
     let mut tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>> = None;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut num_threads = 1;
+    let mut show_wdl = false;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -74,6 +75,8 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                         } else {
                             println!("info string Failed to load Syzygy tablebases from {}", path);
                         }
+                    } else if name == "uci_showwdl" && tokens[3] == "value" {
+                        show_wdl = tokens[4].to_lowercase() == "true";
                     }
                 }
             }
@@ -92,6 +95,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                     tb.clone(),
                     stop_flag.clone(),
                     num_threads,
+                    show_wdl,
                     &tokens,
                 );
             }
@@ -149,7 +153,7 @@ pub fn uci_loop(nnue: Arc<NNUE>) {
                     // Let's run it synchronously.
                     
                     let mut search = Box::new(Search::new(
-                        Arc::new(SharedState::new(tt.clone(), tb.clone(), stop_flag.clone(), vec![])),
+                        Arc::new(SharedState::new(tt.clone(), tb.clone(), stop_flag.clone(), vec![], show_wdl)),
                         0,
                     ));
                     
@@ -255,6 +259,7 @@ fn parse_go(
     tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>>,
     stop: Arc<AtomicBool>,
     num_threads: usize,
+    show_wdl: bool,
     tokens: &[&str],
 ) {
     let mut depth = 6;
@@ -332,7 +337,7 @@ fn parse_go(
                     move_vec.push(root_moves.moves[i]);
                 }
             }
-            let shared_state = Arc::new(SharedState::new(tt.clone(), tb.clone(), stop.clone(), move_vec));
+            let shared_state = Arc::new(SharedState::new(tt.clone(), tb.clone(), stop.clone(), move_vec, show_wdl));
 
             let mut workers = vec![];
 
@@ -408,7 +413,7 @@ pub fn run_bench(nnue: Arc<NNUE>, args: &[String]) {
         stop_flag.store(false, Ordering::Relaxed);
         
         let mut search = Box::new(Search::new(
-            Arc::new(SharedState::new(tt.clone(), None, stop_flag.clone(), vec![])),
+            Arc::new(SharedState::new(tt.clone(), None, stop_flag.clone(), vec![], false)),
             0,
         ));
         

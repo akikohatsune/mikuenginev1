@@ -174,3 +174,30 @@ pub fn endgame_evaluate(board: &Board, raw_eval: i32) -> i32 {
 
     raw_eval
 }
+
+// Stockfish WDL Logistic Curve Model
+pub fn win_rate_model(v: i32, board: &Board) -> i32 {
+    let pawns = board.color_piece_bb(Color::White, PieceType::Pawn).count()
+              + board.color_piece_bb(Color::Black, PieceType::Pawn).count();
+    let knights = board.color_piece_bb(Color::White, PieceType::Knight).count()
+                + board.color_piece_bb(Color::Black, PieceType::Knight).count();
+    let bishops = board.color_piece_bb(Color::White, PieceType::Bishop).count()
+                + board.color_piece_bb(Color::Black, PieceType::Bishop).count();
+    let rooks = board.color_piece_bb(Color::White, PieceType::Rook).count()
+              + board.color_piece_bb(Color::Black, PieceType::Rook).count();
+    let queens = board.color_piece_bb(Color::White, PieceType::Queen).count()
+               + board.color_piece_bb(Color::Black, PieceType::Queen).count();
+               
+    let material = pawns + 3 * knights + 3 * bishops + 5 * rooks + 9 * queens;
+    // The fitted model only uses data for material counts in [17, 78], anchored at count 58.
+    let m = (material as f64).clamp(17.0, 78.0) / 58.0;
+    
+    let a_s = [-72.32565836, 185.93832038, -144.58862193, 416.44950446];
+    let b_s = [83.86794042, -136.06112997, 69.98820887, 47.62901433];
+    
+    let a = (((a_s[0] * m + a_s[1]) * m + a_s[2]) * m) + a_s[3];
+    let b = (((b_s[0] * m + b_s[1]) * m + b_s[2]) * m) + b_s[3];
+    
+    (0.5 + 1000.0 / (1.0 + ((a - v as f64) / b).exp())) as i32
+}
+

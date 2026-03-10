@@ -61,16 +61,18 @@ pub struct SharedState {
     pub stop_flag: Arc<AtomicBool>,
     pub root_moves: Mutex<RootMoveList>,
     pub global_best_move: AtomicU64,
+    pub show_wdl: bool,
 }
 
 impl SharedState {
-    pub fn new(tt: Arc<TranspositionTable>, tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>>, stop_flag: Arc<AtomicBool>, root_moves: Vec<Move>) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, tb: Option<Arc<pyrrhic_rs::TableBases<crate::search::MikuAdapter>>>, stop_flag: Arc<AtomicBool>, root_moves: Vec<Move>, show_wdl: bool) -> Self {
         SharedState {
             tt,
             tb,
             stop_flag,
             root_moves: Mutex::new(RootMoveList::new(root_moves)),
             global_best_move: AtomicU64::new(0),
+            show_wdl,
         }
     }
     

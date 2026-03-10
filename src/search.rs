@@ -1179,14 +1179,23 @@ impl Search {
                 pv_str.push_str(&format!("{:?} ", self.pv_table[0][i]));
             }
 
+            let wdl_str = if self.smp.show_wdl && score.abs() <= MATE_SCORE - 100 {
+                let wdl_w = crate::eval::win_rate_model(score, board);
+                let wdl_l = crate::eval::win_rate_model(-score, board);
+                let wdl_d = 1000 - wdl_w - wdl_l;
+                format!(" wdl {} {} {}", wdl_w, wdl_d, wdl_l)
+            } else {
+                String::new()
+            };
+
             if self.thread_id == 0 {
                 // Stockfish info string format:
-                // info depth {d} seldepth {d} multipv 1 score {score} nodes {nodes} nps {nps} hashfull {hashfull} tbhits 0 time {time} pv {pv}
                 println!(
-                    "info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}",
+                    "info depth {} seldepth {} multipv 1 score {}{} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}",
                     d,
                     d, // MikuEngine doesn't track seldepth yet, so we just mirror depth
                     score_str,
+                    wdl_str,
                     self.nodes,
                     nps,
                     hashfull,
