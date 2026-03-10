@@ -60,8 +60,8 @@ pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
         output += l2_c as i32 * params.out_weight[i] as i32;
     }
 
-    // Scale output to centipawns
-    output / 16
+    // Scale output to centipawns (divide by 600 to match standard WDL-based NNUE scale)
+    (output / 600).clamp(-4000, 4000)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -105,6 +105,6 @@ pub fn evaluate(side: Color, acc: &Accumulator, params: &NetworkParams) -> i32 {
         output += l2_c as i32 * params.out_weight[i] as i32;
     }
 
-    // Scale output to centipawns
-    output / 256
+    // Scale output to centipawns (divide by 600 to match standard WDL-based NNUE scale)
+    (output / 600).clamp(-4000, 4000)
 }
